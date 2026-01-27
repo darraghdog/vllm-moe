@@ -45,6 +45,13 @@ if TYPE_CHECKING:
     VLLM_LOGGING_COLOR: str = "auto"
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
+    VLLM_BLOCK_USAGE_STATS: bool = False
+    VLLM_BLOCK_USAGE_LOG_INTERVAL: float = 30.0
+    VLLM_ATTENTION_SPARSITY_STATS: bool = False
+    VLLM_ATTENTION_SPARSITY_THRESHOLD: float = 30.0
+    VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS: bool = False
+    VLLM_SKIP_SOFTMAX_THRESHOLD: float = 2.0
+    VLLM_SKIP_SOFTMAX_SAMPLE_RATE: float = 1.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_ATTENTION_BACKEND: str | None = None
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
@@ -635,6 +642,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LOG_STATS_INTERVAL": lambda: val
     if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
     else 10.0,
+    # If set, vllm will track KV block usage statistics
+    "VLLM_BLOCK_USAGE_STATS": lambda: bool(
+        int(os.getenv("VLLM_BLOCK_USAGE_STATS", "0"))
+    ),
+    # Only used when VLLM_BLOCK_USAGE_STATS is enabled.
+    "VLLM_BLOCK_USAGE_LOG_INTERVAL": lambda: float(
+        os.getenv("VLLM_BLOCK_USAGE_LOG_INTERVAL", "30.0")
+    ),
+    # If set, vllm will track attention sparsity statistics
+    "VLLM_ATTENTION_SPARSITY_STATS": lambda: bool(
+        int(os.getenv("VLLM_ATTENTION_SPARSITY_STATS", "0"))
+    ),
+    # Threshold for attention sparsity analysis
+    "VLLM_ATTENTION_SPARSITY_THRESHOLD": lambda: float(
+        os.getenv("VLLM_ATTENTION_SPARSITY_THRESHOLD", "30.0")
+    ),
+    # If set, vllm will analyze skip softmax block sparsity
+    "VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS": lambda: bool(
+        int(os.getenv("VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS", "0"))
+    ),
+    # Threshold for skip softmax analysis (m_global - m_local)
+    "VLLM_SKIP_SOFTMAX_THRESHOLD": lambda: float(
+        os.getenv("VLLM_SKIP_SOFTMAX_THRESHOLD", "2.0")
+    ),
+    # Sample rate for skip softmax analysis (0.0-1.0)
+    "VLLM_SKIP_SOFTMAX_SAMPLE_RATE": lambda: float(
+        os.getenv("VLLM_SKIP_SOFTMAX_SAMPLE_RATE", "1.0")
+    ),
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging

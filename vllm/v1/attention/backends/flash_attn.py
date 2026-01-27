@@ -3,7 +3,13 @@
 """Attention layer with FlashAttention."""
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
+
+if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_metrics import (
+        AttentionSparsityCollector,
+        SkipSoftmaxBlockAnalyzer,
+    )
 
 import numpy as np
 import torch
@@ -214,6 +220,15 @@ class FlashAttentionMetadata:
 
     causal: bool = True
 
+    # Attention sparsity tracking (Skip Softmax analysis)
+    attention_sparsity_collector: "AttentionSparsityCollector | None" = None
+
+    # True per-KV-block Skip Softmax analysis (TensorRT-LLM style)
+    skip_softmax_block_analyzer: "SkipSoftmaxBlockAnalyzer | None" = None
+
+    # Block size for KV cache (needed by skip softmax analyzer)
+    block_size: int = 16
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -309,6 +324,39 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # Sliding window size to be used with the AOT scheduler will be
         # populated on first build() call.
         self.aot_sliding_window: tuple[int, int] | None = None
+
+        # Block usage tracking for cache utilization analysis
+        self.block_usage_collector = None
+        if envs.VLLM_BLOCK_USAGE_STATS:
+            from vllm.v1.core.kv_cache_metrics import BlockUsageCollector
+
+            self.block_usage_collector = BlockUsageCollector(
+                enabled=True,
+                log_interval=envs.VLLM_BLOCK_USAGE_LOG_INTERVAL,
+            )
+
+        # Attention sparsity tracking for Skip Softmax analysis
+        self.attention_sparsity_collector = None
+        if envs.VLLM_ATTENTION_SPARSITY_STATS:
+            from vllm.v1.core.kv_cache_metrics import AttentionSparsityCollector
+
+            self.attention_sparsity_collector = AttentionSparsityCollector(
+                enabled=True,
+                log_interval=envs.VLLM_BLOCK_USAGE_LOG_INTERVAL,
+                threshold=envs.VLLM_ATTENTION_SPARSITY_THRESHOLD,
+            )
+
+        # True per-KV-block Skip Softmax analysis (TensorRT-LLM style)
+        self.skip_softmax_block_analyzer = None
+        if envs.VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS:
+            from vllm.v1.core.kv_cache_metrics import SkipSoftmaxBlockAnalyzer
+
+            self.skip_softmax_block_analyzer = SkipSoftmaxBlockAnalyzer(
+                enabled=True,
+                threshold=envs.VLLM_SKIP_SOFTMAX_THRESHOLD,
+                log_interval=envs.VLLM_BLOCK_USAGE_LOG_INTERVAL,
+                sample_rate=envs.VLLM_SKIP_SOFTMAX_SAMPLE_RATE,
+            )
 
     def build(
         self,
@@ -469,6 +517,15 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
+        # Record block usage statistics if enabled
+        if self.block_usage_collector is not None:
+            self.block_usage_collector.record_batch_blocks(
+                block_table_tensor,
+                num_reqs,
+                seq_lens,
+                self.block_size,
+            )
+
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -488,6 +545,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
+            attention_sparsity_collector=self.attention_sparsity_collector,
+            skip_softmax_block_analyzer=self.skip_softmax_block_analyzer,
+            block_size=self.block_size,
         )
         return attn_metadata
 
@@ -683,29 +743,92 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
             else:
-                flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
-                    out=output[:num_actual_tokens],
-                    cu_seqlens_q=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    seqused_k=seqused_k,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=self.sliding_window,
-                    block_table=block_table,
-                    softcap=self.logits_soft_cap,
-                    scheduler_metadata=scheduler_metadata,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
-                    num_splits=attn_metadata.max_num_splits,
-                    s_aux=self.sinks,
+                # Check if we need to track attention sparsity
+                # Skip during CUDA graph capture (can't do .cpu() operations)
+                track_sparsity = (
+                    attn_metadata.attention_sparsity_collector is not None
+                    and not torch.cuda.is_current_stream_capturing()
                 )
+
+                if track_sparsity:
+                    # Call with LSE return for sparsity analysis
+                    _, lse = flash_attn_varlen_func(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=self.sliding_window,
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=scheduler_metadata,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=layer._q_scale.expand(descale_shape),
+                        k_descale=layer._k_scale.expand(descale_shape),
+                        v_descale=layer._v_scale.expand(descale_shape),
+                        num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                        return_softmax_lse=True,
+                    )
+                    # Record sparsity from LSE values
+                    # num_blocks = total tokens / block_size (approx)
+                    num_blocks = (
+                        attn_metadata.max_seq_len + 15
+                    ) // 16  # assuming block_size=16
+                    attn_metadata.attention_sparsity_collector.record_attention_lse(
+                        lse, num_blocks
+                    )
+                else:
+                    # Standard call without LSE overhead
+                    flash_attn_varlen_func(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=self.sliding_window,
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=scheduler_metadata,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=layer._q_scale.expand(descale_shape),
+                        k_descale=layer._k_scale.expand(descale_shape),
+                        v_descale=layer._v_scale.expand(descale_shape),
+                        num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                    )
+
+                # Run true per-KV-block Skip Softmax analysis if enabled
+                # This runs after the main attention (analysis mode only)
+                if (
+                    attn_metadata.skip_softmax_block_analyzer is not None
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    # Get layer name for per-layer tracking
+                    layer_name = getattr(layer, 'layer_name', 'unknown')
+                    attn_metadata.skip_softmax_block_analyzer.analyze_attention(
+                        query=query[:num_actual_tokens],
+                        key_cache=key_cache,
+                        block_table=block_table,
+                        seq_lens=seqused_k,
+                        query_start_loc=cu_seqlens_q,
+                        scale=self.scale,
+                        block_size=attn_metadata.block_size,
+                        layer_name=layer_name,
+                    )
+
                 return output
 
         # Cascade attention (rare case).
