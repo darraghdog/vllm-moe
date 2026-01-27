@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS: bool = False
     VLLM_SKIP_SOFTMAX_THRESHOLD: float = 2.0
     VLLM_SKIP_SOFTMAX_SAMPLE_RATE: float = 1.0
+    VLLM_SKIP_SOFTMAX_OUTPUT_FILE: str | None = None
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_ATTENTION_BACKEND: str | None = None
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
@@ -669,6 +670,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sample rate for skip softmax analysis (0.0-1.0)
     "VLLM_SKIP_SOFTMAX_SAMPLE_RATE": lambda: float(
         os.getenv("VLLM_SKIP_SOFTMAX_SAMPLE_RATE", "1.0")
+    ),
+    # Output file for skip softmax statistics (JSON)
+    "VLLM_SKIP_SOFTMAX_OUTPUT_FILE": lambda: os.getenv(
+        "VLLM_SKIP_SOFTMAX_OUTPUT_FILE"
     ),
     # Trace function calls
     # If set to 1, vllm will trace function calls

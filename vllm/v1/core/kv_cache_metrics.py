@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV cache metrics tracking."""
 
+import json
 import random
 import time
 from collections import defaultdict, deque
@@ -340,6 +341,7 @@ class SkipSoftmaxBlockAnalyzer:
         threshold: float = 2.0,
         log_interval: float = 30.0,
         sample_rate: float = 1.0,
+        output_file: str | None = None,
     ):
         """Initialize the Skip Softmax block analyzer.
 
@@ -351,11 +353,14 @@ class SkipSoftmaxBlockAnalyzer:
             log_interval: Seconds between log messages
             sample_rate: Fraction of attention calls to analyze (0.0-1.0).
                 Use < 1.0 to reduce overhead while still collecting stats.
+            output_file: Path to write full statistics JSON. If set, all
+                layer/head stats are written to this file on each log interval.
         """
         self.enabled = enabled
         self.threshold = threshold
         self.log_interval = log_interval
         self.sample_rate = sample_rate
+        self.output_file = output_file
 
         self._total_blocks = 0
         self._skippable_blocks = 0
@@ -540,6 +545,57 @@ class SkipSoftmaxBlockAnalyzer:
                 "Least sparse (layer, head): %s",
                 {f"L{l}H{h}": f"{s:.1f}%" for (l, h), s in low_sparse_lh},
             )
+
+            # Write full statistics to file if output_file is set
+            if self.output_file:
+                self._write_stats_to_file(layer_head_sparsity, sparsity_pct)
+
+    def _write_stats_to_file(
+        self,
+        layer_head_sparsity: dict[tuple[int | None, int], float],
+        overall_sparsity: float,
+    ) -> None:
+        """Write full statistics to JSON file.
+
+        Args:
+            layer_head_sparsity: Dict mapping (layer_idx, head_idx) to sparsity %
+            overall_sparsity: Overall sparsity percentage
+        """
+        try:
+            # Build full statistics dict
+            stats = {
+                "timestamp": time.time(),
+                "threshold": self.threshold,
+                "sample_rate": self.sample_rate,
+                "overall": {
+                    "total_blocks": self._total_blocks,
+                    "skippable_blocks": self._skippable_blocks,
+                    "sparsity_pct": overall_sparsity,
+                    "total_calls": self._total_calls,
+                    "sampled_calls": self._sampled_calls,
+                },
+                "per_layer_head": {},
+            }
+
+            # Add all layer/head combinations sorted by sparsity (descending)
+            sorted_lh = sorted(
+                layer_head_sparsity.items(), key=lambda x: x[1], reverse=True
+            )
+            for (layer_idx, head_idx), sparsity in sorted_lh:
+                key = f"L{layer_idx}H{head_idx}"
+                stats["per_layer_head"][key] = {
+                    "layer": layer_idx,
+                    "head": head_idx,
+                    "sparsity_pct": round(sparsity, 2),
+                }
+
+            # Write to file (overwrite each time)
+            with open(self.output_file, "w") as f:
+                json.dump(stats, f, indent=2)
+
+            logger.info("Wrote skip softmax stats to %s", self.output_file)
+        except Exception as e:
+            logger.warning("Failed to write skip softmax stats to file: %s", e)
 
     def force_log(self) -> None:
         """Force logging of current stats."""

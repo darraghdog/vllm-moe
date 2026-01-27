@@ -356,6 +356,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 threshold=envs.VLLM_SKIP_SOFTMAX_THRESHOLD,
                 log_interval=envs.VLLM_BLOCK_USAGE_LOG_INTERVAL,
                 sample_rate=envs.VLLM_SKIP_SOFTMAX_SAMPLE_RATE,
+                output_file=envs.VLLM_SKIP_SOFTMAX_OUTPUT_FILE,
             )
 
     def build(
