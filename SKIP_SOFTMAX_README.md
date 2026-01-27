@@ -21,8 +21,9 @@ This implementation tracks which (layer, head) combinations have the highest spa
 | `VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS` | bool | `0` | Enable skip softmax block analysis |
 | `VLLM_SKIP_SOFTMAX_THRESHOLD` | float | `2.0` | Threshold for (m_global - m_local) to consider a block skippable |
 | `VLLM_SKIP_SOFTMAX_SAMPLE_RATE` | float | `1.0` | Sampling rate (0.0-1.0) to reduce overhead |
+| `VLLM_SKIP_SOFTMAX_OUTPUT_FILE` | str | `None` | Path to write full JSON statistics (all layer/head combos) |
+| `VLLM_BLOCK_USAGE_LOG_INTERVAL` | float | `30.0` | Logging interval in seconds (increase for less frequent logging) |
 | `VLLM_BLOCK_USAGE_STATS` | bool | `0` | Enable KV block usage statistics |
-| `VLLM_BLOCK_USAGE_LOG_INTERVAL` | float | `30.0` | Logging interval in seconds |
 | `VLLM_ATTENTION_SPARSITY_STATS` | bool | `0` | Enable attention sparsity statistics |
 | `VLLM_ATTENTION_SPARSITY_THRESHOLD` | float | `30.0` | Threshold for attention sparsity analysis |
 
@@ -35,6 +36,8 @@ import os
 os.environ["VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS"] = "1"
 os.environ["VLLM_SKIP_SOFTMAX_THRESHOLD"] = "2.0"
 os.environ["VLLM_SKIP_SOFTMAX_SAMPLE_RATE"] = "0.1"  # 10% sampling to reduce overhead
+os.environ["VLLM_BLOCK_USAGE_LOG_INTERVAL"] = "300"  # Log every 5 minutes (less overhead)
+os.environ["VLLM_SKIP_SOFTMAX_OUTPUT_FILE"] = "/tmp/skip_softmax_stats.json"  # Write ALL stats to file
 ```
 
 Or via command line:
@@ -43,6 +46,8 @@ Or via command line:
 VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS=1 \
 VLLM_SKIP_SOFTMAX_THRESHOLD=2.0 \
 VLLM_SKIP_SOFTMAX_SAMPLE_RATE=0.1 \
+VLLM_BLOCK_USAGE_LOG_INTERVAL=300 \
+VLLM_SKIP_SOFTMAX_OUTPUT_FILE=/tmp/skip_softmax_stats.json \
 python -m vllm.entrypoints.openai.api_server --model <model_name>
 ```
 
@@ -60,6 +65,32 @@ This helps identify:
 - **Most sparse**: Attention heads that could benefit most from Skip Softmax optimization
 - **Least sparse**: Attention heads where Skip Softmax would provide minimal benefit
 
+## JSON Output Format
+
+When `VLLM_SKIP_SOFTMAX_OUTPUT_FILE` is set, ALL layer/head statistics are written to a JSON file:
+
+```json
+{
+  "timestamp": 1706356281.123,
+  "threshold": 2.0,
+  "sample_rate": 0.1,
+  "overall": {
+    "total_blocks": 100000,
+    "skippable_blocks": 42000,
+    "sparsity_pct": 42.0,
+    "total_calls": 1000,
+    "sampled_calls": 100
+  },
+  "per_layer_head": {
+    "L36H46": {"layer": 36, "head": 46, "sparsity_pct": 99.7},
+    "L36H12": {"layer": 36, "head": 12, "sparsity_pct": 99.7},
+    ...
+  }
+}
+```
+
+The `per_layer_head` section is sorted by sparsity (highest first), making it easy to identify the most sparse (rarely used) attention heads.
+
 ## Files
 
 | File | Description |
@@ -71,6 +102,11 @@ This helps identify:
 
 ## Performance Considerations
 
-- Use `VLLM_SKIP_SOFTMAX_SAMPLE_RATE=0.1` (10% sampling) to reduce overhead during production profiling
-- The Triton kernel runs asynchronously but still adds some overhead
-- Disable analysis (`VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS=0`) for production inference after profiling is complete
+To minimize impact on inference throughput:
+
+1. **Reduce sample rate**: `VLLM_SKIP_SOFTMAX_SAMPLE_RATE=0.1` (10% sampling)
+2. **Increase log interval**: `VLLM_BLOCK_USAGE_LOG_INTERVAL=300` (5 minutes instead of 30 seconds)
+3. **Use file output**: Set `VLLM_SKIP_SOFTMAX_OUTPUT_FILE` to get ALL stats without verbose logging
+4. **Disable after profiling**: Set `VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS=0` for production inference
+
+The Triton kernel runs asynchronously but still adds overhead proportional to the sample rate.
