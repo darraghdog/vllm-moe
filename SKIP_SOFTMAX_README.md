@@ -110,3 +110,54 @@ To minimize impact on inference throughput:
 4. **Disable after profiling**: Set `VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS=0` for production inference
 
 The Triton kernel runs asynchronously but still adds overhead proportional to the sample rate.
+
+## Phase 2 TODO: Head Skipping Implementation
+
+### Analysis Results
+
+Based on collected statistics from `skip_softmax_stats.json` (threshold=2.0, 10% sampling, ~20K sampled calls):
+
+| Metric | Value |
+|--------|-------|
+| Total (layer, head) combinations | 1088 |
+| Heads with >= 99% sparsity | 359 (33.0%) - safe to skip |
+| Heads with >= 98% sparsity | 656 (60.3%) |
+| Overall sparsity | 84.2% |
+
+**Key Finding**: All 64 heads in Layer 3 (L3H0-L3H63) have 0% sparsity - these should never be skipped. This layer appears critical for attention.
+
+### Implementation Plan
+
+1. **Config File Format**: Create a JSON/YAML config specifying which (layer, head) combinations to skip:
+   ```json
+   {
+     "skip_heads": [
+       {"layer": 0, "head": 40},
+       {"layer": 0, "head": 18},
+       ...
+     ],
+     "min_sparsity_threshold": 99.0
+   }
+   ```
+
+2. **Modify FlashAttention Backend**:
+   - Skip KV cache writes for specified heads
+   - Skip attention computation for those heads
+   - Output zeros for skipped head positions
+   - Add `skip_head_mask` tensor to attention call
+
+3. **Runtime Toggle**: Environment variable to enable/disable head skipping
+
+### Expected Benefits
+
+| Optimization | Estimated Impact |
+|--------------|------------------|
+| Attention compute reduction | ~33% (if skipping >= 99% sparsity heads) |
+| KV cache memory savings | ~33% for skipped heads |
+| Overall inference speedup | 10-15% estimated |
+
+### Files to Modify
+
+- `vllm/v1/attention/backends/flash_attn.py` - Core attention changes
+- `vllm/v1/core/kv_cache_manager.py` - KV cache allocation changes
+- New: `vllm/config/skip_heads.py` - Config loading and validation
