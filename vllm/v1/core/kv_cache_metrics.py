@@ -326,14 +326,17 @@ class SkipSoftmaxBlockAnalyzer:
     position), this analyzer computes per-KV-block max logits using a
     custom Triton kernel. This matches TensorRT-LLM's Skip Softmax granularity.
 
-    Tracks statistics per (layer, head) to identify which specific attention
-    heads in which layers are most sparse.
+    Tracks statistics per (layer, head) at multiple thresholds to identify
+    which specific attention heads in which layers are most sparse.
 
     The TensorRT-LLM algorithm:
     1. For each KV block, compute m_local = max(Q * K[block]^T)
     2. Track m_global = max across all KV blocks
     3. If (m_global - m_local) > threshold, the block can be skipped
     """
+
+    # Default thresholds for multi-threshold analysis
+    DEFAULT_THRESHOLDS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
 
     def __init__(
         self,
@@ -342,40 +345,46 @@ class SkipSoftmaxBlockAnalyzer:
         log_interval: float = 30.0,
         sample_rate: float = 1.0,
         output_file: str | None = None,
+        thresholds: list[float] | None = None,
     ):
         """Initialize the Skip Softmax block analyzer.
 
         Args:
             enabled: Whether analysis is enabled
-            threshold: Skip threshold in log-space. Blocks where
-                (m_global - m_local) > threshold are considered skippable.
-                TensorRT-LLM uses ~2.0 for near-lossless accuracy.
+            threshold: Primary skip threshold for logging (default 2.0)
             log_interval: Seconds between log messages
             sample_rate: Fraction of attention calls to analyze (0.0-1.0).
                 Use < 1.0 to reduce overhead while still collecting stats.
             output_file: Path to write full statistics JSON. If set, all
                 layer/head stats are written to this file on each log interval.
+            thresholds: List of thresholds to track (default: DEFAULT_THRESHOLDS).
+                Stats are collected at each threshold for post-hoc analysis.
         """
         self.enabled = enabled
         self.threshold = threshold
         self.log_interval = log_interval
         self.sample_rate = sample_rate
         self.output_file = output_file
+        self.thresholds = thresholds if thresholds is not None else self.DEFAULT_THRESHOLDS
 
-        self._total_blocks = 0
-        self._skippable_blocks = 0
         self._total_calls = 0
         self._sampled_calls = 0
         self._last_log_time = time.monotonic()
 
-        # Per-(layer, head) statistics
-        # Key: (layer_name, head_idx), Value: total blocks
+        # Per-(layer, head) statistics with multi-threshold support
+        # Key: (layer_name, head_idx)
+        # Value: total blocks for this (layer, head)
         self._per_layer_head_total: dict[tuple[str, int], int] = defaultdict(int)
-        self._per_layer_head_skippable: dict[tuple[str, int], int] = defaultdict(int)
+        # Value: number of readings/samples for this (layer, head)
+        self._per_layer_head_readings: dict[tuple[str, int], int] = defaultdict(int)
+        # Value: dict of threshold -> skippable block count
+        self._per_layer_head_at_threshold: dict[tuple[str, int], dict[float, int]] = defaultdict(
+            lambda: {t: 0 for t in self.thresholds}
+        )
 
         # Per-layer statistics (aggregated across heads)
         self._per_layer_total: dict[str, int] = defaultdict(int)
-        self._per_layer_skippable: dict[str, int] = defaultdict(int)
+        self._per_layer_readings: dict[str, int] = defaultdict(int)
 
     def analyze_attention(
         self,
@@ -416,7 +425,7 @@ class SkipSoftmaxBlockAnalyzer:
 
         # Import here to avoid circular imports
         from vllm.attention.ops.triton_skip_softmax_analysis import (
-            compute_skip_softmax_sparsity,
+            compute_skip_softmax_sparsity_multi_threshold,
             skip_softmax_block_analysis,
         )
 
@@ -431,27 +440,27 @@ class SkipSoftmaxBlockAnalyzer:
             block_size=block_size,
         )
 
-        # Compute sparsity statistics
-        total_blocks, skippable_blocks, per_head_stats = compute_skip_softmax_sparsity(
+        # Compute sparsity statistics at multiple thresholds
+        per_head_total, per_head_at_threshold = compute_skip_softmax_sparsity_multi_threshold(
             block_max=block_max,
             seq_lens=seq_lens,
-            threshold=self.threshold,
+            thresholds=self.thresholds,
             block_size=block_size,
         )
 
-        # Update running totals
-        self._total_blocks += total_blocks
-        self._skippable_blocks += skippable_blocks
-
         # Update per-layer stats
-        self._per_layer_total[layer_name] += total_blocks
-        self._per_layer_skippable[layer_name] += skippable_blocks
+        layer_total = sum(per_head_total.values())
+        self._per_layer_total[layer_name] += layer_total
+        self._per_layer_readings[layer_name] += 1
 
-        # Update per-(layer, head) stats
-        for h, (head_total, head_skippable) in per_head_stats.items():
+        # Update per-(layer, head) stats with multi-threshold data
+        for h, head_total in per_head_total.items():
             key = (layer_name, h)
             self._per_layer_head_total[key] += head_total
-            self._per_layer_head_skippable[key] += head_skippable
+            self._per_layer_head_readings[key] += 1
+            # Update skippable counts at each threshold
+            for t, skippable in per_head_at_threshold[h].items():
+                self._per_layer_head_at_threshold[key][t] += skippable
 
         self._maybe_log()
 
@@ -472,10 +481,16 @@ class SkipSoftmaxBlockAnalyzer:
 
     def _log_stats(self) -> None:
         """Log current Skip Softmax block analysis statistics."""
-        if self._total_blocks == 0:
+        total_blocks = sum(self._per_layer_head_total.values())
+        if total_blocks == 0:
             return
 
-        sparsity_pct = 100.0 * self._skippable_blocks / self._total_blocks
+        # Compute overall sparsity at primary threshold
+        total_skippable = sum(
+            self._per_layer_head_at_threshold[key].get(self.threshold, 0)
+            for key in self._per_layer_head_total
+        )
+        sparsity_pct = 100.0 * total_skippable / total_blocks
 
         sample_info = ""
         if self.sample_rate < 1.0:
@@ -484,51 +499,33 @@ class SkipSoftmaxBlockAnalyzer:
         logger.info(
             "Skip Softmax Block Analysis: total_kv_blocks=%d, "
             "skippable_blocks=%d, sparsity=%.1f%%, threshold=%.1f%s",
-            self._total_blocks,
-            self._skippable_blocks,
+            total_blocks,
+            total_skippable,
             sparsity_pct,
             self.threshold,
             sample_info,
         )
 
-        # Per-layer breakdown
-        layer_sparsity = {}
-        for layer_name in self._per_layer_total:
-            if self._per_layer_total[layer_name] > 0:
-                layer_sparsity[layer_name] = (
-                    100.0 * self._per_layer_skippable[layer_name]
-                    / self._per_layer_total[layer_name]
-                )
-
-        if layer_sparsity:
-            # Sort by layer index if possible
-            sorted_layers = sorted(
-                layer_sparsity.items(),
-                key=lambda x: (self._extract_layer_idx(x[0]) or 0, x[0])
-            )
-
-            # Log top 5 sparsest and bottom 5 least sparse layers
-            by_sparsity = sorted(sorted_layers, key=lambda x: x[1], reverse=True)
-            top_sparse = by_sparsity[:5]
-            low_sparse = by_sparsity[-5:]
-
-            logger.info(
-                "Per-layer sparsity: sparsest=%s",
-                {self._extract_layer_idx(l) or l: f"{s:.1f}%" for l, s in top_sparse},
-            )
-            logger.info(
-                "Per-layer sparsity: least_sparse=%s",
-                {self._extract_layer_idx(l) or l: f"{s:.1f}%" for l, s in low_sparse},
-            )
-
-        # Per-(layer, head) breakdown - find most and least sparse combinations
+        # Per-(layer, head) breakdown at primary threshold
         layer_head_sparsity = {}
+        layer_head_data = {}  # Full data for file output
         for (layer_name, head), total in self._per_layer_head_total.items():
             if total > 0:
-                skippable = self._per_layer_head_skippable[(layer_name, head)]
-                sparsity = 100.0 * skippable / total
                 layer_idx = self._extract_layer_idx(layer_name)
+                readings = self._per_layer_head_readings[(layer_name, head)]
+                thresh_data = self._per_layer_head_at_threshold[(layer_name, head)]
+
+                # Sparsity at primary threshold for logging
+                skippable = thresh_data.get(self.threshold, 0)
+                sparsity = 100.0 * skippable / total
                 layer_head_sparsity[(layer_idx, head)] = sparsity
+
+                # Full data for file output
+                layer_head_data[(layer_idx, head)] = {
+                    "total_blocks": total,
+                    "readings": readings,
+                    "at_threshold": thresh_data,
+                }
 
         if layer_head_sparsity:
             sorted_lh = sorted(
@@ -538,55 +535,86 @@ class SkipSoftmaxBlockAnalyzer:
             low_sparse_lh = sorted_lh[-10:]
 
             logger.info(
-                "Most sparse (layer, head): %s",
+                "Most sparse (layer, head) at threshold=%.1f: %s",
+                self.threshold,
                 {f"L{l}H{h}": f"{s:.1f}%" for (l, h), s in top_sparse_lh},
             )
             logger.info(
-                "Least sparse (layer, head): %s",
+                "Least sparse (layer, head) at threshold=%.1f: %s",
+                self.threshold,
                 {f"L{l}H{h}": f"{s:.1f}%" for (l, h), s in low_sparse_lh},
             )
 
             # Write full statistics to file if output_file is set
             if self.output_file:
-                self._write_stats_to_file(layer_head_sparsity, sparsity_pct)
+                self._write_stats_to_file(layer_head_data, total_blocks, total_skippable)
 
     def _write_stats_to_file(
         self,
-        layer_head_sparsity: dict[tuple[int | None, int], float],
-        overall_sparsity: float,
+        layer_head_data: dict[tuple[int | None, int], dict],
+        total_blocks: int,
+        total_skippable: int,
     ) -> None:
-        """Write full statistics to JSON file.
+        """Write full statistics to JSON file with multi-threshold data.
 
         Args:
-            layer_head_sparsity: Dict mapping (layer_idx, head_idx) to sparsity %
-            overall_sparsity: Overall sparsity percentage
+            layer_head_data: Dict mapping (layer_idx, head_idx) to stats dict
+            total_blocks: Total blocks across all layer/heads
+            total_skippable: Total skippable blocks at primary threshold
         """
         try:
+            overall_sparsity = 100.0 * total_skippable / total_blocks if total_blocks > 0 else 0.0
+
+            # Compute overall stats at each threshold
+            overall_at_threshold = {t: 0 for t in self.thresholds}
+            for data in layer_head_data.values():
+                for t, count in data["at_threshold"].items():
+                    overall_at_threshold[t] += count
+
             # Build full statistics dict
             stats = {
                 "timestamp": time.time(),
-                "threshold": self.threshold,
+                "primary_threshold": self.threshold,
+                "thresholds": self.thresholds,
                 "sample_rate": self.sample_rate,
                 "overall": {
-                    "total_blocks": self._total_blocks,
-                    "skippable_blocks": self._skippable_blocks,
-                    "sparsity_pct": overall_sparsity,
+                    "total_blocks": total_blocks,
+                    "skippable_blocks": total_skippable,
+                    "sparsity_pct": round(overall_sparsity, 2),
                     "total_calls": self._total_calls,
                     "sampled_calls": self._sampled_calls,
+                    "at_threshold": {
+                        str(t): {
+                            "skippable": overall_at_threshold[t],
+                            "sparsity_pct": round(100.0 * overall_at_threshold[t] / total_blocks, 2) if total_blocks > 0 else 0.0,
+                        }
+                        for t in self.thresholds
+                    },
                 },
                 "per_layer_head": {},
             }
 
-            # Add all layer/head combinations sorted by sparsity (descending)
+            # Add all layer/head combinations sorted by sparsity at primary threshold (descending)
             sorted_lh = sorted(
-                layer_head_sparsity.items(), key=lambda x: x[1], reverse=True
+                layer_head_data.items(),
+                key=lambda x: x[1]["at_threshold"].get(self.threshold, 0) / max(x[1]["total_blocks"], 1),
+                reverse=True,
             )
-            for (layer_idx, head_idx), sparsity in sorted_lh:
+            for (layer_idx, head_idx), data in sorted_lh:
                 key = f"L{layer_idx}H{head_idx}"
+                head_total = data["total_blocks"]
                 stats["per_layer_head"][key] = {
                     "layer": layer_idx,
                     "head": head_idx,
-                    "sparsity_pct": round(sparsity, 2),
+                    "total_blocks": head_total,
+                    "readings": data["readings"],
+                    "at_threshold": {
+                        str(t): {
+                            "skippable": data["at_threshold"][t],
+                            "sparsity_pct": round(100.0 * data["at_threshold"][t] / head_total, 2) if head_total > 0 else 0.0,
+                        }
+                        for t in self.thresholds
+                    },
                 }
 
             # Write to file (overwrite each time)
@@ -604,12 +632,11 @@ class SkipSoftmaxBlockAnalyzer:
 
     def reset(self) -> None:
         """Reset all statistics."""
-        self._total_blocks = 0
-        self._skippable_blocks = 0
         self._total_calls = 0
         self._sampled_calls = 0
         self._per_layer_head_total.clear()
-        self._per_layer_head_skippable.clear()
+        self._per_layer_head_readings.clear()
+        self._per_layer_head_at_threshold.clear()
         self._per_layer_total.clear()
-        self._per_layer_skippable.clear()
+        self._per_layer_readings.clear()
         self._last_log_time = time.monotonic()

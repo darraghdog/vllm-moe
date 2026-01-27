@@ -343,6 +343,10 @@ def skip_softmax_block_analysis(
     return block_max
 
 
+# Default thresholds for multi-threshold analysis
+DEFAULT_THRESHOLDS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+
+
 def compute_skip_softmax_sparsity(
     block_max: torch.Tensor,  # [num_seqs, max_num_blocks, num_heads]
     seq_lens: torch.Tensor,  # [num_seqs]
@@ -400,3 +404,67 @@ def compute_skip_softmax_sparsity(
         skippable_blocks += head_skippable
 
     return total_blocks, skippable_blocks, per_head_stats
+
+
+def compute_skip_softmax_sparsity_multi_threshold(
+    block_max: torch.Tensor,  # [num_seqs, max_num_blocks, num_heads]
+    seq_lens: torch.Tensor,  # [num_seqs]
+    thresholds: list[float] | None = None,
+    block_size: int = 16,
+) -> tuple[int, dict[int, int], dict[int, dict[float, int]]]:
+    """Compute Skip Softmax sparsity at multiple thresholds.
+
+    Args:
+        block_max: Per-block max logits from skip_softmax_block_analysis
+        seq_lens: Sequence lengths
+        thresholds: List of thresholds to evaluate (default: DEFAULT_THRESHOLDS)
+        block_size: KV cache block size
+
+    Returns:
+        Tuple of (total_blocks_per_head, per_head_total, per_head_skippable_at_threshold)
+        - total_blocks_per_head: dict mapping head_idx to total block count
+        - per_head_skippable_at_threshold: dict mapping head_idx to dict of threshold -> skippable count
+    """
+    if thresholds is None:
+        thresholds = DEFAULT_THRESHOLDS
+
+    num_seqs, max_num_blocks, num_heads = block_max.shape
+
+    # Per-head stats: head -> total blocks
+    per_head_total: dict[int, int] = {}
+    # Per-head stats at each threshold: head -> {threshold -> skippable count}
+    per_head_at_threshold: dict[int, dict[float, int]] = {}
+
+    # Process on CPU for accurate counting
+    block_max_cpu = block_max.cpu().float()
+    seq_lens_cpu = seq_lens.cpu()
+
+    for h in range(num_heads):
+        head_total = 0
+        head_skippable_at_thresh = {t: 0 for t in thresholds}
+
+        for s in range(num_seqs):
+            seq_len = int(seq_lens_cpu[s].item())
+            num_blocks = (seq_len + block_size - 1) // block_size
+
+            if num_blocks == 0:
+                continue
+
+            # Get valid block max values for this sequence and head
+            valid_block_max = block_max_cpu[s, :num_blocks, h]
+
+            # Compute global max for this sequence/head
+            m_global = valid_block_max.max().item()
+
+            # Compute diff once, then count at each threshold
+            diff = m_global - valid_block_max
+
+            head_total += num_blocks
+            for t in thresholds:
+                skippable = (diff > t).sum().item()
+                head_skippable_at_thresh[t] += int(skippable)
+
+        per_head_total[h] = head_total
+        per_head_at_threshold[h] = head_skippable_at_thresh
+
+    return per_head_total, per_head_at_threshold

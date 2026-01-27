@@ -67,36 +67,55 @@ This helps identify:
 
 ## JSON Output Format
 
-When `VLLM_SKIP_SOFTMAX_OUTPUT_FILE` is set, ALL layer/head statistics are written to a JSON file:
+When `VLLM_SKIP_SOFTMAX_OUTPUT_FILE` is set, statistics are written with **multi-threshold tracking**:
 
 ```json
 {
   "timestamp": 1706356281.123,
-  "threshold": 2.0,
+  "primary_threshold": 2.0,
+  "thresholds": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
   "sample_rate": 0.1,
   "overall": {
-    "total_blocks": 100000,
-    "skippable_blocks": 42000,
-    "sparsity_pct": 42.0,
-    "total_calls": 1000,
-    "sampled_calls": 100
+    "total_blocks": 100000000,
+    "skippable_blocks": 82000000,
+    "sparsity_pct": 82.0,
+    "total_calls": 10000,
+    "sampled_calls": 1000,
+    "at_threshold": {
+      "1.0": {"skippable": 90000000, "sparsity_pct": 90.0},
+      "2.0": {"skippable": 82000000, "sparsity_pct": 82.0},
+      "3.0": {"skippable": 70000000, "sparsity_pct": 70.0}
+    }
   },
   "per_layer_head": {
-    "L36H46": {"layer": 36, "head": 46, "sparsity_pct": 99.7},
-    "L36H12": {"layer": 36, "head": 12, "sparsity_pct": 99.7},
-    ...
+    "L0H40": {
+      "layer": 0,
+      "head": 40,
+      "total_blocks": 100000,
+      "readings": 500,
+      "at_threshold": {
+        "1.0": {"skippable": 99000, "sparsity_pct": 99.0},
+        "2.0": {"skippable": 98000, "sparsity_pct": 98.0},
+        "3.0": {"skippable": 95000, "sparsity_pct": 95.0}
+      }
+    }
   }
 }
 ```
 
-The `per_layer_head` section is sorted by sparsity (highest first), making it easy to identify the most sparse (rarely used) attention heads.
+Key fields:
+- **thresholds**: All thresholds tracked (enables post-hoc analysis)
+- **readings**: Number of samples per (layer, head) for proper averaging
+- **at_threshold**: Sparsity stats at each threshold level
+
+This matches TensorRT-LLM's approach where threshold scales with sequence length.
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `vllm/attention/ops/triton_skip_softmax_analysis.py` | Triton kernel for per-KV-block max logit computation |
-| `vllm/v1/core/kv_cache_metrics.py` | `SkipSoftmaxBlockAnalyzer`, `BlockUsageCollector`, `AttentionSparsityCollector` classes |
+| `vllm/attention/ops/triton_skip_softmax_analysis.py` | Triton kernel (`skip_softmax_block_analysis`), `compute_skip_softmax_sparsity_multi_threshold()` |
+| `vllm/v1/core/kv_cache_metrics.py` | `SkipSoftmaxBlockAnalyzer` class with multi-threshold tracking |
 | `vllm/v1/attention/backends/flash_attn.py` | Integration with FlashAttention backend |
 | `vllm/envs.py` | Environment variable definitions |
 
@@ -104,9 +123,18 @@ The `per_layer_head` section is sorted by sparsity (highest first), making it ea
 
 To minimize impact on inference throughput:
 
-1. **Reduce sample rate**: `VLLM_SKIP_SOFTMAX_SAMPLE_RATE=0.1` (10% sampling)
-2. **Increase log interval**: `VLLM_BLOCK_USAGE_LOG_INTERVAL=300` (5 minutes instead of 30 seconds)
+1. **Reduce sample rate**: `VLLM_SKIP_SOFTMAX_SAMPLE_RATE=0.01` (1% sampling recommended)
+2. **Increase log interval**: `VLLM_BLOCK_USAGE_LOG_INTERVAL=90` (90 seconds)
 3. **Use file output**: Set `VLLM_SKIP_SOFTMAX_OUTPUT_FILE` to get ALL stats without verbose logging
+
+Minimal overhead configuration:
+```bash
+VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS=1 \
+VLLM_SKIP_SOFTMAX_SAMPLE_RATE=0.01 \
+VLLM_BLOCK_USAGE_LOG_INTERVAL=90 \
+VLLM_SKIP_SOFTMAX_OUTPUT_FILE=/tmp/skip_softmax_stats.json \
+python -m vllm.entrypoints.openai.api_server --model <model>
+```
 4. **Disable after profiling**: Set `VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS=0` for production inference
 
 The Triton kernel runs asynchronously but still adds overhead proportional to the sample rate.
