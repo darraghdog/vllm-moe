@@ -53,6 +53,10 @@ if TYPE_CHECKING:
     VLLM_SKIP_SOFTMAX_THRESHOLD: float = 2.0
     VLLM_SKIP_SOFTMAX_SAMPLE_RATE: float = 1.0
     VLLM_SKIP_SOFTMAX_OUTPUT_FILE: str | None = None
+    # Skip softmax execution configuration
+    VLLM_SKIP_SOFTMAX_ENABLED: bool = False
+    VLLM_SKIP_SOFTMAX_CONFIG_FILE: str | None = None
+    VLLM_SKIP_SOFTMAX_MODE: str = "mask"  # "mask" or "skip_kv"
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_ATTENTION_BACKEND: str | None = None
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
@@ -674,6 +678,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Output file for skip softmax statistics (JSON)
     "VLLM_SKIP_SOFTMAX_OUTPUT_FILE": lambda: os.getenv(
         "VLLM_SKIP_SOFTMAX_OUTPUT_FILE"
+    ),
+    # Skip softmax execution: Enable skipping attention heads at runtime
+    "VLLM_SKIP_SOFTMAX_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_SKIP_SOFTMAX_ENABLED", "0"))
+    ),
+    # Path to skip heads configuration JSON file
+    "VLLM_SKIP_SOFTMAX_CONFIG_FILE": lambda: os.getenv(
+        "VLLM_SKIP_SOFTMAX_CONFIG_FILE"
+    ),
+    # Skip softmax mode: "mask" (zero output) or "skip_kv" (zero K/V before cache)
+    "VLLM_SKIP_SOFTMAX_MODE": lambda: os.getenv(
+        "VLLM_SKIP_SOFTMAX_MODE", "mask"
     ),
     # Trace function calls
     # If set to 1, vllm will trace function calls

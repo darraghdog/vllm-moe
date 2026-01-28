@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_metrics import (
         AttentionSparsityCollector,
+        SkipHeadConfig,
         SkipSoftmaxBlockAnalyzer,
     )
 
@@ -229,6 +230,9 @@ class FlashAttentionMetadata:
     # Block size for KV cache (needed by skip softmax analyzer)
     block_size: int = 16
 
+    # Skip head configuration for runtime head skipping
+    skip_head_config: "SkipHeadConfig | None" = None
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -358,6 +362,19 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 sample_rate=envs.VLLM_SKIP_SOFTMAX_SAMPLE_RATE,
                 output_file=envs.VLLM_SKIP_SOFTMAX_OUTPUT_FILE,
             )
+
+        # Skip head configuration for runtime head skipping
+        self.skip_head_config = None
+        if envs.VLLM_SKIP_SOFTMAX_ENABLED:
+            from vllm.v1.core.kv_cache_metrics import SkipHeadConfig
+
+            self.skip_head_config = SkipHeadConfig.get_instance()
+            if self.skip_head_config.enabled:
+                logger.info(
+                    "Skip softmax execution enabled: mode=%s, %d layers configured",
+                    self.skip_head_config.mode,
+                    len(self.skip_head_config.skip_heads),
+                )
 
     def build(
         self,
@@ -549,6 +566,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             attention_sparsity_collector=self.attention_sparsity_collector,
             skip_softmax_block_analyzer=self.skip_softmax_block_analyzer,
             block_size=self.block_size,
+            skip_head_config=self.skip_head_config,
         )
         return attn_metadata
 
@@ -693,6 +711,31 @@ class FlashAttentionImpl(AttentionImpl):
             and key is not None
             and value is not None
         ):
+            # Skip KV mode: zero K/V before caching for skipped heads
+            # This saves memory bandwidth by not loading zeros during attention
+            skip_config = attn_metadata.skip_head_config
+            if (
+                skip_config is not None
+                and skip_config.enabled
+                and skip_config.mode == "skip_kv"
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                layer_idx = getattr(layer, "layer_idx", None)
+                if layer_idx is not None and skip_config.should_skip_layer(layer_idx):
+                    kv_skip_mask = skip_config.get_kv_skip_mask(
+                        layer_idx,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        key.device,
+                    )
+                    if kv_skip_mask.any():
+                        # Zero out K/V for skipped KV heads before caching
+                        # key/value shape: [num_tokens, num_kv_heads, head_dim]
+                        key = key.clone()
+                        value = value.clone()
+                        key[:, kv_skip_mask, :] = 0.0
+                        value[:, kv_skip_mask, :] = 0.0
+
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.
             # NOTE(woosuk): Here, key and value are padded while slot_mapping is
@@ -830,6 +873,23 @@ class FlashAttentionImpl(AttentionImpl):
                         layer_name=layer_name,
                     )
 
+                # Mask mode: zero output for skipped heads after attention
+                skip_config = attn_metadata.skip_head_config
+                if (
+                    skip_config is not None
+                    and skip_config.enabled
+                    and skip_config.mode == "mask"
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    layer_idx = getattr(layer, "layer_idx", None)
+                    if layer_idx is not None and skip_config.should_skip_layer(layer_idx):
+                        q_skip_mask = skip_config.get_skip_mask(
+                            layer_idx, self.num_heads, output.device
+                        )
+                        if q_skip_mask.any():
+                            # output shape: [num_tokens, num_heads, head_dim]
+                            output[:num_actual_tokens, q_skip_mask, :] = 0.0
+
                 return output
 
         # Cascade attention (rare case).
@@ -859,6 +919,24 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale=layer._v_scale,
             s_aux=self.sinks,
         )
+
+        # Mask mode: zero output for skipped heads after cascade attention
+        skip_config = attn_metadata.skip_head_config
+        if (
+            skip_config is not None
+            and skip_config.enabled
+            and skip_config.mode == "mask"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            layer_idx = getattr(layer, "layer_idx", None)
+            if layer_idx is not None and skip_config.should_skip_layer(layer_idx):
+                q_skip_mask = skip_config.get_skip_mask(
+                    layer_idx, self.num_heads, output.device
+                )
+                if q_skip_mask.any():
+                    # output shape: [num_tokens, num_heads, head_dim]
+                    output[:num_actual_tokens, q_skip_mask, :] = 0.0
+
         return output
 
     def _forward_with_dcp(

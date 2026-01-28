@@ -663,3 +663,170 @@ class SkipSoftmaxBlockAnalyzer:
         self._per_layer_total.clear()
         self._per_layer_readings.clear()
         self._last_log_time = time.monotonic()
+
+
+class SkipHeadConfig:
+    """Configuration for skipping attention heads during inference.
+
+    This class loads skip head configuration from a JSON file and provides
+    methods to get skip masks for attention heads. Supports both mask mode
+    (zero output for skipped heads) and skip_kv mode (zero K/V before caching).
+
+    For GQA models, skip_kv mode only skips a KV head if ALL corresponding
+    Q heads are marked for skipping.
+    """
+
+    _instance: "SkipHeadConfig | None" = None
+
+    def __init__(self, config_path: str | None = None, mode: str = "mask"):
+        """Initialize SkipHeadConfig.
+
+        Args:
+            config_path: Path to JSON config file with skip head specifications.
+            mode: Skip mode - "mask" (zero output) or "skip_kv" (zero K/V before cache).
+        """
+        self.enabled = False
+        self.mode = mode
+        self.skip_heads: dict[int, set[int]] = {}  # layer_idx -> set of head_idx
+        self._skip_mask_cache: dict[tuple[int, int, str], torch.Tensor] = {}
+        self._kv_skip_mask_cache: dict[tuple[int, int, int, str], torch.Tensor] = {}
+
+        if config_path:
+            self._load_config(config_path)
+
+    def _load_config(self, config_path: str) -> None:
+        """Load configuration from JSON file.
+
+        Supports two formats:
+        1. Full format with skip_heads list:
+           {"skip_heads": [{"layer": 7, "head": 0, "sparsity_t2": 99.0}, ...]}
+        2. Compact format with layer -> heads mapping:
+           {"skip_mask": {"7": [0, 1, 2], "9": [0, 3, 5]}}
+        """
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+
+            # Check for full format (skip_heads list)
+            if "skip_heads" in config:
+                for item in config["skip_heads"]:
+                    layer_idx = item["layer"]
+                    head_idx = item["head"]
+                    if layer_idx not in self.skip_heads:
+                        self.skip_heads[layer_idx] = set()
+                    self.skip_heads[layer_idx].add(head_idx)
+
+            # Check for compact format (skip_mask dict)
+            elif "skip_mask" in config:
+                for layer_str, heads in config["skip_mask"].items():
+                    layer_idx = int(layer_str)
+                    self.skip_heads[layer_idx] = set(heads)
+
+            self.enabled = len(self.skip_heads) > 0
+
+            # Log summary
+            total_skip_heads = sum(len(h) for h in self.skip_heads.values())
+            num_layers = len(self.skip_heads)
+            logger.info(
+                "Loaded skip head config: %d heads across %d layers, mode=%s",
+                total_skip_heads,
+                num_layers,
+                self.mode,
+            )
+
+        except Exception as e:
+            logger.warning("Failed to load skip head config from %s: %s", config_path, e)
+            self.enabled = False
+
+    def get_skip_mask(self, layer_idx: int, num_heads: int, device: torch.device) -> torch.Tensor:
+        """Get boolean mask [num_heads] where True = skip this head.
+
+        Args:
+            layer_idx: Layer index.
+            num_heads: Number of Q heads.
+            device: Device to create tensor on.
+
+        Returns:
+            Boolean tensor of shape [num_heads] where True means skip.
+        """
+        cache_key = (layer_idx, num_heads, str(device))
+        if cache_key in self._skip_mask_cache:
+            return self._skip_mask_cache[cache_key]
+
+        mask = torch.zeros(num_heads, dtype=torch.bool, device=device)
+
+        if layer_idx in self.skip_heads:
+            skip_set = self.skip_heads[layer_idx]
+            for head_idx in skip_set:
+                if head_idx < num_heads:
+                    mask[head_idx] = True
+
+        self._skip_mask_cache[cache_key] = mask
+        return mask
+
+    def get_kv_skip_mask(
+        self, layer_idx: int, num_q_heads: int, num_kv_heads: int, device: torch.device
+    ) -> torch.Tensor:
+        """Get KV skip mask for GQA models.
+
+        For GQA, only skip KV head if ALL corresponding Q heads are skipped.
+
+        Args:
+            layer_idx: Layer index.
+            num_q_heads: Number of Q heads.
+            num_kv_heads: Number of KV heads.
+            device: Device to create tensor on.
+
+        Returns:
+            Boolean tensor of shape [num_kv_heads] where True means skip.
+        """
+        cache_key = (layer_idx, num_q_heads, num_kv_heads, str(device))
+        if cache_key in self._kv_skip_mask_cache:
+            return self._kv_skip_mask_cache[cache_key]
+
+        q_mask = self.get_skip_mask(layer_idx, num_q_heads, device)
+
+        if num_q_heads == num_kv_heads:
+            # MHA: KV mask is same as Q mask
+            self._kv_skip_mask_cache[cache_key] = q_mask
+            return q_mask
+
+        # GQA: only skip KV head if ALL corresponding Q heads are skipped
+        heads_per_group = num_q_heads // num_kv_heads
+        kv_mask = torch.zeros(num_kv_heads, dtype=torch.bool, device=device)
+
+        for kv_idx in range(num_kv_heads):
+            q_start = kv_idx * heads_per_group
+            q_end = q_start + heads_per_group
+            # Only skip KV head if all Q heads in the group are skipped
+            kv_mask[kv_idx] = q_mask[q_start:q_end].all()
+
+        self._kv_skip_mask_cache[cache_key] = kv_mask
+        return kv_mask
+
+    def should_skip_layer(self, layer_idx: int) -> bool:
+        """Check if any heads should be skipped in this layer."""
+        return layer_idx in self.skip_heads and len(self.skip_heads[layer_idx]) > 0
+
+    def clear_cache(self) -> None:
+        """Clear cached masks (useful if moving between devices)."""
+        self._skip_mask_cache.clear()
+        self._kv_skip_mask_cache.clear()
+
+    @classmethod
+    def get_instance(cls) -> "SkipHeadConfig":
+        """Get singleton instance, initializing from env vars if needed."""
+        if cls._instance is None:
+            from vllm import envs
+
+            config_path = envs.VLLM_SKIP_SOFTMAX_CONFIG_FILE
+            mode = envs.VLLM_SKIP_SOFTMAX_MODE
+
+            cls._instance = cls(config_path=config_path, mode=mode)
+
+        return cls._instance
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Reset singleton instance (for testing)."""
+        cls._instance = None
