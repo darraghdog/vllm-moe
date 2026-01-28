@@ -411,3 +411,111 @@ TRT-LLM's Skip Softmax implementation (from `/notebooks/pkgs/TensorRT-LLM/`):
 - `vllm/v1/core/kv_cache_manager.py` - KV cache allocation changes
 - `vllm/v1/core/kv_cache_metrics.py` - Generate skip config from stats
 - New: `vllm/config/skip_heads_config.py` - Config loading and validation
+
+---
+
+## Kaggle Deployment
+
+To deploy skip softmax subset mode to a Kaggle notebook with an existing vLLM installation, copy these files:
+
+### Required Files (Minimal Set)
+
+```bash
+# From skip-softmax-perf branch to your vllm installation
+cp vllm/v1/attention/backends/flash_attn.py  <your_vllm>/v1/attention/backends/
+cp vllm/v1/core/kv_cache_metrics.py          <your_vllm>/v1/core/
+cp vllm/envs.py                              <your_vllm>/
+```
+
+### Optional Files
+
+```bash
+# Utility to generate skip config from collected stats
+cp vllm/utils/generate_skip_config.py        <your_vllm>/utils/
+```
+
+### Environment Variables to Add to envs.py
+
+If your target `envs.py` doesn't have the skip softmax entries, add these:
+
+**In the class definition (around line 50-60):**
+```python
+    # Skip softmax analysis
+    VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS: bool = False
+    VLLM_SKIP_SOFTMAX_THRESHOLD: float = 2.0
+    VLLM_SKIP_SOFTMAX_SAMPLE_RATE: float = 1.0
+    VLLM_SKIP_SOFTMAX_OUTPUT_FILE: str | None = None
+    # Skip softmax execution configuration
+    VLLM_SKIP_SOFTMAX_ENABLED: bool = False
+    VLLM_SKIP_SOFTMAX_CONFIG_FILE: str | None = None
+    VLLM_SKIP_SOFTMAX_MODE: str = "mask"  # "mask", "skip_kv", or "subset"
+```
+
+**In the environment_variables dict (around line 660-700):**
+```python
+    "VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS": lambda: bool(
+        int(os.getenv("VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS", "0"))
+    ),
+    "VLLM_SKIP_SOFTMAX_THRESHOLD": lambda: float(
+        os.getenv("VLLM_SKIP_SOFTMAX_THRESHOLD", "2.0")
+    ),
+    "VLLM_SKIP_SOFTMAX_SAMPLE_RATE": lambda: float(
+        os.getenv("VLLM_SKIP_SOFTMAX_SAMPLE_RATE", "1.0")
+    ),
+    "VLLM_SKIP_SOFTMAX_OUTPUT_FILE": lambda: os.getenv(
+        "VLLM_SKIP_SOFTMAX_OUTPUT_FILE"
+    ),
+    "VLLM_SKIP_SOFTMAX_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_SKIP_SOFTMAX_ENABLED", "0"))
+    ),
+    "VLLM_SKIP_SOFTMAX_CONFIG_FILE": lambda: os.getenv(
+        "VLLM_SKIP_SOFTMAX_CONFIG_FILE"
+    ),
+    "VLLM_SKIP_SOFTMAX_MODE": lambda: os.getenv(
+        "VLLM_SKIP_SOFTMAX_MODE", "mask"
+    ),
+```
+
+### Kaggle Notebook Setup
+
+```python
+import os
+
+# Copy files (run once)
+!cp /kaggle/input/vllm-moe/vllm/v1/attention/backends/flash_attn.py \
+    /kaggle/working/vllm/v1/attention/backends/
+!cp /kaggle/input/vllm-moe/vllm/v1/core/kv_cache_metrics.py \
+    /kaggle/working/vllm/v1/core/
+!cp /kaggle/input/vllm-moe/vllm/envs.py \
+    /kaggle/working/vllm/
+
+# Enable subset mode
+os.environ["VLLM_SKIP_SOFTMAX_ENABLED"] = "1"
+os.environ["VLLM_SKIP_SOFTMAX_CONFIG_FILE"] = "/kaggle/input/skip_heads_config.json"
+os.environ["VLLM_SKIP_SOFTMAX_MODE"] = "subset"
+
+# Start vLLM server...
+```
+
+### Verify Subset Mode is Active
+
+Check logs for these messages:
+```
+Skip softmax: Using SUBSET mode with 1060 skipped heads
+Layer 7: Active heads 44/64 (31.2% compute savings)
+```
+
+### Quick Test Script
+
+```python
+# Test that skip config is loaded correctly
+from vllm.v1.core.kv_cache_metrics import SkipHeadConfig
+
+config = SkipHeadConfig.get_instance()
+if config.enabled:
+    print(f"Skip softmax enabled: mode={config.mode}")
+    print(f"Skip layers: {sorted(config.skip_heads.keys())}")
+    print(f"Total skipped Q heads: {sum(len(v) for v in config.skip_heads.values())}")
+else:
+    print("Skip softmax NOT enabled - check env vars")
+```
