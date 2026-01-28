@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    SparseAttentionSpec,
 )
 
 if current_platform.is_rocm():
@@ -423,13 +424,113 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 sliding_window=self.sliding_window,
             )
-        else:
-            return FullAttentionSpec(
-                block_size=block_size,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                dtype=self.kv_cache_torch_dtype,
+
+        # Check for sparse KV cache via skip head config
+        sparse_spec = self._get_sparse_kv_cache_spec(vllm_config, block_size)
+        if sparse_spec is not None:
+            return sparse_spec
+
+        return FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            dtype=self.kv_cache_torch_dtype,
+        )
+
+    def _get_sparse_kv_cache_spec(
+        self, vllm_config: VllmConfig, block_size: int
+    ) -> SparseAttentionSpec | None:
+        """Check if this layer should use sparse KV cache allocation.
+
+        Returns SparseAttentionSpec if skip head config is enabled and this
+        layer has skippable KV heads. Returns None otherwise.
+        """
+        # Check if sparse KV cache mode is enabled
+        if not envs.VLLM_SKIP_SOFTMAX_ENABLED:
+            return None
+
+        # Get skip head config
+        from vllm.v1.core.kv_cache_metrics import SkipHeadConfig
+        skip_config = SkipHeadConfig.get_instance()
+
+        if not skip_config.enabled:
+            return None
+
+        # Only use sparse KV cache in "sparse_kv" mode
+        # "subset" mode uses full KV cache but computes fewer Q heads
+        # "mask" mode zeros output but still needs full KV cache
+        if skip_config.mode != "sparse_kv":
+            return None
+
+        # Extract layer index from layer name
+        layer_idx = self._extract_layer_idx()
+        if layer_idx is None:
+            return None
+
+        # Check if this layer has skippable heads
+        if not skip_config.should_skip_layer(layer_idx):
+            return None
+
+        # Get count of active KV heads
+        active_kv_count = skip_config.get_layer_active_kv_count(
+            layer_idx, self.num_heads, self.num_kv_heads
+        )
+
+        # If all KV heads are active, use normal spec
+        if active_kv_count >= self.num_kv_heads:
+            return None
+
+        # If no KV heads are active, something is wrong - return normal spec
+        if active_kv_count == 0:
+            logger.warning(
+                "Layer %d has no active KV heads - using full KV cache",
+                layer_idx,
             )
+            return None
+
+        # Only use sparse allocation if active_kv_count divides evenly into
+        # original num_kv_heads. This ensures page sizes can be unified.
+        # Valid values for 8 KV heads: 1, 2, 4, 8
+        if self.num_kv_heads % active_kv_count != 0:
+            logger.info(
+                "Layer %d: Skipping sparse KV cache - %d KV heads doesn't "
+                "divide evenly into %d (using full allocation)",
+                layer_idx,
+                active_kv_count,
+                self.num_kv_heads,
+            )
+            return None
+
+        # Get sparse mappings
+        sparse_to_original, original_to_sparse = skip_config.get_sparse_kv_mappings(
+            layer_idx, self.num_heads, self.num_kv_heads
+        )
+
+        logger.info(
+            "Layer %d: Sparse KV cache - %d/%d KV heads active (%.1f%% memory savings)",
+            layer_idx,
+            active_kv_count,
+            self.num_kv_heads,
+            100.0 * (1 - active_kv_count / self.num_kv_heads),
+        )
+
+        return SparseAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=active_kv_count,  # REDUCED
+            head_size=self.head_size,
+            dtype=self.kv_cache_torch_dtype,
+            original_num_kv_heads=self.num_kv_heads,
+            sparse_to_original=sparse_to_original,
+            original_to_sparse=original_to_sparse,
+        )
+
+    def _extract_layer_idx(self) -> int | None:
+        """Extract layer index from layer_name like 'model.layers.5.self_attn'."""
+        import re
+        match = re.search(r'layers\.(\d+)', self.layer_name)
+        if match:
+            return int(match.group(1))
+        return None
 
 
 class MultiHeadAttention(nn.Module):

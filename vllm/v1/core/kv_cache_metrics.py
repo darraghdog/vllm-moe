@@ -844,6 +844,67 @@ class SkipHeadConfig:
         kv_skip_mask = self.get_kv_skip_mask(layer_idx, num_q_heads, num_kv_heads, device)
         return torch.where(~kv_skip_mask)[0]
 
+    def get_layer_active_kv_count(
+        self, layer_idx: int, num_q_heads: int, num_kv_heads: int
+    ) -> int:
+        """Get count of active (non-skippable) KV heads for a layer.
+
+        This is used for determining reduced KV cache allocation.
+
+        Args:
+            layer_idx: Layer index.
+            num_q_heads: Number of Q heads.
+            num_kv_heads: Number of KV heads.
+
+        Returns:
+            Number of active KV heads (may be less than num_kv_heads if
+            some KV heads can be skipped).
+        """
+        if not self.should_skip_layer(layer_idx):
+            return num_kv_heads
+
+        active_kv = self.get_active_kv_head_indices(
+            layer_idx, num_q_heads, num_kv_heads, torch.device('cpu')
+        )
+        return len(active_kv)
+
+    def get_sparse_kv_mappings(
+        self, layer_idx: int, num_q_heads: int, num_kv_heads: int
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Get sparse KV head mappings for a layer.
+
+        Returns mappings for converting between original KV head indices
+        and sparse (compact) indices.
+
+        Args:
+            layer_idx: Layer index.
+            num_q_heads: Number of Q heads.
+            num_kv_heads: Number of KV heads.
+
+        Returns:
+            Tuple of (sparse_to_original, original_to_sparse) where:
+            - sparse_to_original: tuple mapping sparse index -> original index
+            - original_to_sparse: tuple mapping original index -> sparse index
+              (-1 if that KV head is skipped)
+        """
+        active_kv = self.get_active_kv_head_indices(
+            layer_idx, num_q_heads, num_kv_heads, torch.device('cpu')
+        )
+        active_kv_list = active_kv.tolist()
+
+        # sparse_to_original: sparse[i] -> original[active_kv_list[i]]
+        sparse_to_original = tuple(active_kv_list)
+
+        # original_to_sparse: original[i] -> sparse index or -1 if skipped
+        original_to_sparse = []
+        for orig_idx in range(num_kv_heads):
+            if orig_idx in active_kv_list:
+                original_to_sparse.append(active_kv_list.index(orig_idx))
+            else:
+                original_to_sparse.append(-1)
+
+        return sparse_to_original, tuple(original_to_sparse)
+
     def get_q_to_subset_kv_mapping(
         self,
         active_q_indices: torch.Tensor,

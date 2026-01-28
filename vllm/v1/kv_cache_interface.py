@@ -159,6 +159,61 @@ class FullAttentionSpec(AttentionSpec):
 
 
 @dataclass(frozen=True)
+class SparseAttentionSpec(FullAttentionSpec):
+    """Spec for layers with sparse KV cache (fewer KV heads stored).
+
+    For GQA models where some Q heads are skipped, if ALL Q heads corresponding
+    to a KV head are skipped, that KV head doesn't need to be stored.
+    This spec describes layers where some KV heads are skipped.
+
+    Memory savings: (original_num_kv_heads - num_kv_heads) / original_num_kv_heads
+    """
+
+    # Original number of KV heads in model config
+    original_num_kv_heads: int = 0
+
+    # Mapping: sparse_idx -> original_idx (length = active KV heads)
+    # e.g., (0, 2, 5, 7) means sparse[0]=orig[0], sparse[1]=orig[2], etc.
+    sparse_to_original: tuple[int, ...] = ()
+
+    # Mapping: original_idx -> sparse_idx (-1 if skipped)
+    # e.g., (0, -1, 1, -1, -1, 2, -1, 3) for 4 active out of 8
+    original_to_sparse: tuple[int, ...] = ()
+
+    @classmethod
+    def merge(cls, specs: list["SparseAttentionSpec"]) -> "SparseAttentionSpec":
+        """Merge SparseAttentionSpec objects - must have identical mappings."""
+        assert all(isinstance(spec, SparseAttentionSpec) for spec in specs), (
+            "All specs must be SparseAttentionSpec"
+        )
+        # All sparse specs in a group must have the same mappings
+        first = specs[0]
+        for spec in specs[1:]:
+            assert spec.original_num_kv_heads == first.original_num_kv_heads, (
+                "All SparseAttentionSpec in group must have same original_num_kv_heads"
+            )
+            assert spec.sparse_to_original == first.sparse_to_original, (
+                "All SparseAttentionSpec in group must have same sparse_to_original"
+            )
+            assert spec.original_to_sparse == first.original_to_sparse, (
+                "All SparseAttentionSpec in group must have same original_to_sparse"
+            )
+        # Use parent merge for base fields, then add sparse fields
+        base_merged = FullAttentionSpec.merge(specs)
+        return cls(
+            block_size=base_merged.block_size,
+            num_kv_heads=base_merged.num_kv_heads,
+            head_size=base_merged.head_size,
+            dtype=base_merged.dtype,
+            sliding_window=base_merged.sliding_window,
+            attention_chunk_size=base_merged.attention_chunk_size,
+            original_num_kv_heads=first.original_num_kv_heads,
+            sparse_to_original=first.sparse_to_original,
+            original_to_sparse=first.original_to_sparse,
+        )
+
+
+@dataclass(frozen=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None

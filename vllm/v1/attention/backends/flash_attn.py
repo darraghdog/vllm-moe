@@ -55,7 +55,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_kv_cache_layout,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, SparseAttentionSpec
 
 logger = init_logger(__name__)
 
@@ -233,6 +233,10 @@ class FlashAttentionMetadata:
     # Skip head configuration for runtime head skipping
     skip_head_config: "SkipHeadConfig | None" = None
 
+    # Sparse KV cache spec for this layer group (if using sparse KV allocation)
+    # This is per-layer, so it will be looked up from the layer's kv_cache_spec
+    sparse_kv_spec: SparseAttentionSpec | None = None
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -377,6 +381,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     "mask": "zero output after attention",
                     "skip_kv": "zero K/V before caching",
                     "subset": "compute only active heads (real savings)",
+                    "sparse_kv": "sparse KV cache allocation (memory savings)",
                 }.get(self.skip_head_config.mode, self.skip_head_config.mode)
                 logger.info(
                     "Skip softmax execution enabled: mode=%s (%s), "
@@ -714,6 +719,12 @@ class FlashAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
+        # Check for sparse KV cache allocation
+        # kv_cache shape: [2, num_blocks, block_size, num_kv_heads, head_size]
+        # If kv_cache has fewer KV heads than self.num_kv_heads, it's sparse
+        cache_num_kv_heads = key_cache.shape[2]  # After unbind, shape is [num_blocks, block_size, num_kv_heads, head_size]
+        is_sparse_kv = cache_num_kv_heads < self.num_kv_heads
+
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
         # in KV cache.
@@ -722,48 +733,115 @@ class FlashAttentionImpl(AttentionImpl):
             and key is not None
             and value is not None
         ):
-            # Skip KV mode: zero K/V before caching for skipped heads
-            # This saves memory bandwidth by not loading zeros during attention
-            skip_config = attn_metadata.skip_head_config
-            if (
-                skip_config is not None
-                and skip_config.enabled
-                and skip_config.mode == "skip_kv"
-                and not torch.cuda.is_current_stream_capturing()
-            ):
-                layer_idx = getattr(layer, "layer_idx", None)
-                if layer_idx is not None and skip_config.should_skip_layer(layer_idx):
-                    kv_skip_mask = skip_config.get_kv_skip_mask(
-                        layer_idx,
-                        self.num_heads,
-                        self.num_kv_heads,
-                        key.device,
-                    )
-                    if kv_skip_mask.any():
-                        # Zero out K/V for skipped KV heads before caching
-                        # key/value shape: [num_tokens, num_kv_heads, head_dim]
-                        key = key.clone()
-                        value = value.clone()
-                        key[:, kv_skip_mask, :] = 0.0
-                        value[:, kv_skip_mask, :] = 0.0
+            if is_sparse_kv:
+                # Sparse KV mode: extract only active KV heads before caching
+                # This provides real memory savings by not allocating skipped KV heads
+                skip_config = attn_metadata.skip_head_config
+                if (
+                    skip_config is not None
+                    and skip_config.enabled
+                    and skip_config.mode == "sparse_kv"
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    layer_idx = getattr(layer, "layer_idx", None)
+                    if layer_idx is not None and skip_config.should_skip_layer(layer_idx):
+                        # Get sparse mappings
+                        sparse_to_orig, _ = skip_config.get_sparse_kv_mappings(
+                            layer_idx, self.num_heads, self.num_kv_heads
+                        )
+                        # Extract only active KV heads
+                        sparse_indices = torch.tensor(
+                            sparse_to_orig, device=key.device, dtype=torch.long
+                        )
+                        key_sparse = key.index_select(dim=1, index=sparse_indices)
+                        value_sparse = value.index_select(dim=1, index=sparse_indices)
 
-            # Reshape the input keys and values and store them in the cache.
-            # Skip this if sharing KV cache with an earlier attention layer.
-            # NOTE(woosuk): Here, key and value are padded while slot_mapping is
-            # not padded. However, we don't need to do key[:num_actual_tokens]
-            # and value[:num_actual_tokens] because the reshape_and_cache_flash
-            # op uses the slot_mapping's shape to determine the number of
-            # actual tokens.
-            reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+                        # Cache sparse K/V
+                        reshape_and_cache_flash(
+                            key_sparse,
+                            value_sparse,
+                            key_cache,
+                            value_cache,
+                            attn_metadata.slot_mapping,
+                            self.kv_cache_dtype,
+                            layer._k_scale,
+                            layer._v_scale,
+                        )
+                    else:
+                        # Layer mismatch - shouldn't happen
+                        logger.warning(
+                            "Sparse KV cache detected but layer %s not in skip config",
+                            layer_idx,
+                        )
+                        reshape_and_cache_flash(
+                            key[:, :cache_num_kv_heads, :],
+                            value[:, :cache_num_kv_heads, :],
+                            key_cache,
+                            value_cache,
+                            attn_metadata.slot_mapping,
+                            self.kv_cache_dtype,
+                            layer._k_scale,
+                            layer._v_scale,
+                        )
+                else:
+                    # Sparse cache but no skip config - shouldn't happen
+                    logger.warning(
+                        "Sparse KV cache but skip config not enabled"
+                    )
+                    reshape_and_cache_flash(
+                        key[:, :cache_num_kv_heads, :],
+                        value[:, :cache_num_kv_heads, :],
+                        key_cache,
+                        value_cache,
+                        attn_metadata.slot_mapping,
+                        self.kv_cache_dtype,
+                        layer._k_scale,
+                        layer._v_scale,
+                    )
+            else:
+                # Standard (non-sparse) path
+                # Skip KV mode: zero K/V before caching for skipped heads
+                # This saves memory bandwidth by not loading zeros during attention
+                skip_config = attn_metadata.skip_head_config
+                if (
+                    skip_config is not None
+                    and skip_config.enabled
+                    and skip_config.mode == "skip_kv"
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    layer_idx = getattr(layer, "layer_idx", None)
+                    if layer_idx is not None and skip_config.should_skip_layer(layer_idx):
+                        kv_skip_mask = skip_config.get_kv_skip_mask(
+                            layer_idx,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            key.device,
+                        )
+                        if kv_skip_mask.any():
+                            # Zero out K/V for skipped KV heads before caching
+                            # key/value shape: [num_tokens, num_kv_heads, head_dim]
+                            key = key.clone()
+                            value = value.clone()
+                            key[:, kv_skip_mask, :] = 0.0
+                            value[:, kv_skip_mask, :] = 0.0
+
+                # Reshape the input keys and values and store them in the cache.
+                # Skip this if sharing KV cache with an earlier attention layer.
+                # NOTE(woosuk): Here, key and value are padded while slot_mapping is
+                # not padded. However, we don't need to do key[:num_actual_tokens]
+                # and value[:num_actual_tokens] because the reshape_and_cache_flash
+                # op uses the slot_mapping's shape to determine the number of
+                # actual tokens.
+                reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
         if self.kv_cache_dtype.startswith("fp8"):
             # queries are quantized in the attention layer
@@ -781,11 +859,31 @@ class FlashAttentionImpl(AttentionImpl):
             block_table = attn_metadata.block_table
             scheduler_metadata = attn_metadata.scheduler_metadata
 
-            descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+            # Get DCP world size from parallel state (not stored on impl)
+            try:
+                dcp_world_size = get_dcp_group().world_size
+            except AssertionError:
+                dcp_world_size = 1
 
-            # Subset mode: compute only active Q heads for real compute savings
+            # Use cache_num_kv_heads for descale_shape (may be sparse)
+            descale_shape = (cu_seqlens_q.shape[0] - 1, cache_num_kv_heads)
+
+            # Sparse KV mode: run attention with sparse KV cache
             skip_config = attn_metadata.skip_head_config
             layer_idx = getattr(layer, "layer_idx", None)
+            if is_sparse_kv and not torch.cuda.is_current_stream_capturing():
+                return self._forward_with_sparse_kv(
+                    layer,
+                    query,
+                    key_cache,
+                    value_cache,
+                    output,
+                    attn_metadata,
+                    layer_idx,
+                    cache_num_kv_heads,
+                )
+
+            # Subset mode: compute only active Q heads for real compute savings
             use_subset = (
                 skip_config is not None
                 and skip_config.enabled
@@ -793,7 +891,7 @@ class FlashAttentionImpl(AttentionImpl):
                 and layer_idx is not None
                 and skip_config.should_skip_layer(layer_idx)
                 and not torch.cuda.is_current_stream_capturing()
-                and self.dcp_world_size == 1  # Not supported with DCP yet
+                and dcp_world_size == 1  # Not supported with DCP yet
             )
 
             if use_subset:
@@ -807,7 +905,7 @@ class FlashAttentionImpl(AttentionImpl):
                     layer_idx,
                 )
 
-            if self.dcp_world_size > 1:
+            if dcp_world_size > 1:
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
                     key[:num_actual_tokens],
@@ -1176,6 +1274,135 @@ class FlashAttentionImpl(AttentionImpl):
                 v_descale=layer._v_scale.expand(descale_shape),
                 num_splits=0,
                 s_aux=None,  # Not supported with head subsetting
+            )
+
+            # Scatter results back to correct output positions
+            output[:num_actual_tokens, q_idx_tensor, :] = out_group
+
+        return output
+
+    def _forward_with_sparse_kv(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        layer_idx: int | None,
+        cache_num_kv_heads: int,
+    ) -> torch.Tensor:
+        """Forward with sparse KV cache (only active KV heads stored).
+
+        This method handles layers where the KV cache has been allocated with
+        fewer KV heads than the model originally has. It runs attention by
+        mapping Q heads to their sparse KV indices.
+
+        Memory savings: (original - active) / original KV cache memory
+
+        Args:
+            layer: The attention layer module.
+            query: shape = [num_tokens, num_heads, head_size]
+            key_cache: shape = [num_blocks, block_size, active_num_kv_heads, head_size]
+            value_cache: shape = [num_blocks, block_size, active_num_kv_heads, head_size]
+            output: shape = [num_tokens, num_heads, head_size]
+            attn_metadata: Attention metadata.
+            layer_idx: Layer index for skip config lookup.
+            cache_num_kv_heads: Number of KV heads in cache (may be < self.num_kv_heads).
+
+        Returns:
+            output tensor.
+        """
+        skip_config = attn_metadata.skip_head_config
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        cu_seqlens_q = attn_metadata.query_start_loc
+        seqused_k = attn_metadata.seq_lens
+        max_seqlen_q = attn_metadata.max_query_len
+        max_seqlen_k = attn_metadata.max_seq_len
+        block_table = attn_metadata.block_table
+
+        # Get sparse mappings
+        if (
+            skip_config is not None
+            and skip_config.enabled
+            and layer_idx is not None
+            and skip_config.should_skip_layer(layer_idx)
+        ):
+            sparse_to_orig, orig_to_sparse = skip_config.get_sparse_kv_mappings(
+                layer_idx, self.num_heads, self.num_kv_heads
+            )
+        else:
+            # Fallback: assume first N KV heads are active
+            sparse_to_orig = tuple(range(cache_num_kv_heads))
+            orig_to_sparse = tuple(
+                i if i < cache_num_kv_heads else -1
+                for i in range(self.num_kv_heads)
+            )
+
+        # Zero output first (Q heads mapping to skipped KV heads = 0)
+        output[:num_actual_tokens, :, :] = 0.0
+
+        # Map Q heads to sparse KV heads and process per group
+        heads_per_kv = self.num_heads // self.num_kv_heads
+
+        # Build Q head groups by sparse KV index
+        # sparse_kv_idx -> list of original Q head indices
+        sparse_kv_groups: dict[int, list[int]] = {}
+        for orig_kv_idx, sparse_kv_idx in enumerate(orig_to_sparse):
+            if sparse_kv_idx >= 0:  # This KV head is active
+                q_start = orig_kv_idx * heads_per_kv
+                q_end = q_start + heads_per_kv
+                for q_idx in range(q_start, q_end):
+                    if sparse_kv_idx not in sparse_kv_groups:
+                        sparse_kv_groups[sparse_kv_idx] = []
+                    sparse_kv_groups[sparse_kv_idx].append(q_idx)
+
+        # Process each sparse KV head
+        for sparse_kv_idx, q_indices in sparse_kv_groups.items():
+            num_q_in_group = len(q_indices)
+
+            # Extract Q heads for this group
+            q_idx_tensor = torch.tensor(
+                q_indices, device=query.device, dtype=torch.long
+            )
+            q_group = query[:num_actual_tokens, q_idx_tensor, :]
+
+            # Extract single sparse KV head
+            k_single = key_cache[:, :, sparse_kv_idx:sparse_kv_idx+1, :]
+            v_single = value_cache[:, :, sparse_kv_idx:sparse_kv_idx+1, :]
+
+            # Output buffer for this group
+            out_group = torch.empty(
+                num_actual_tokens, num_q_in_group, self.head_size,
+                dtype=query.dtype, device=query.device
+            )
+
+            descale_shape = (cu_seqlens_q.shape[0] - 1, 1)
+
+            # Run attention with N Q heads against 1 sparse KV head
+            flash_attn_varlen_func(
+                q=q_group,
+                k=k_single,
+                v=v_single,
+                out=out_group,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=None,  # Not supported with sparse KV
+                window_size=self.sliding_window,
+                block_table=block_table,
+                softcap=self.logits_soft_cap,
+                scheduler_metadata=None,  # Not supported with sparse KV
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=layer._q_scale.expand(descale_shape),
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+                num_splits=0,
+                s_aux=None,  # Not supported with sparse KV
             )
 
             # Scatter results back to correct output positions

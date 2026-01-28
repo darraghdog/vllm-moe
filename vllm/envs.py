@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     # Skip softmax execution configuration
     VLLM_SKIP_SOFTMAX_ENABLED: bool = False
     VLLM_SKIP_SOFTMAX_CONFIG_FILE: str | None = None
-    VLLM_SKIP_SOFTMAX_MODE: str = "mask"  # "mask", "skip_kv", or "subset"
+    VLLM_SKIP_SOFTMAX_MODE: str = "mask"  # "mask", "skip_kv", "subset", or "sparse_kv"
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_ATTENTION_BACKEND: str | None = None
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
