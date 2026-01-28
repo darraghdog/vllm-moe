@@ -139,33 +139,35 @@ python -m vllm.entrypoints.openai.api_server --model <model>
 
 The Triton kernel runs asynchronously but still adds overhead proportional to the sample rate.
 
-## Phase 2: Skip Softmax Execution (Validation Mode)
+## Phase 2: Skip Softmax Execution
 
-**Status**: Implemented for accuracy validation (not performance optimized)
+**Status**: Production ready (`subset` mode provides real compute savings)
 
-This phase implements runtime head skipping to validate that zeroing sparse heads doesn't degrade model quality. Once accuracy is confirmed, performance optimizations can be added.
+This phase implements runtime head skipping with multiple modes for different use cases.
 
-### New Environment Variables
+### Environment Variables
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `VLLM_SKIP_SOFTMAX_ENABLED` | bool | `0` | Enable runtime head skipping |
 | `VLLM_SKIP_SOFTMAX_CONFIG_FILE` | str | `None` | Path to skip heads JSON config |
-| `VLLM_SKIP_SOFTMAX_MODE` | str | `mask` | Mode: `mask`, `skip_kv`, or `subset` |
+| `VLLM_SKIP_SOFTMAX_MODE` | str | `mask` | Mode: `mask`, `skip_kv`, `subset`, or `sparse_kv` |
 
 ### Execution Modes
 
-| Mode | What it does | Performance | Use Case |
-|------|--------------|-------------|----------|
-| `mask` | Zeros output for skipped heads after attention | Slight overhead | Validation only |
-| `skip_kv` | Zeros K/V before caching | Slight overhead | Validation only |
-| `subset` | Computes only active Q heads (real savings) | **~20% compute reduction** | Production performance |
+| Mode | What it does | Savings Type | Status |
+|------|--------------|--------------|--------|
+| `mask` | Zeros output for skipped heads after attention | None (validation) | ✅ Working |
+| `skip_kv` | Zeros K/V before caching | None (validation) | ✅ Working |
+| `subset` | Computes only active Q heads | **Compute (~45%)** | ✅ **Production** |
+| `sparse_kv` | Allocates fewer KV cache heads | Memory (experimental) | ⚠️ Limited |
 
 **Mode Details**:
 
 - **mask**: Full attention is computed, then skipped head outputs are zeroed. Use for accuracy validation.
 - **skip_kv**: K/V values are zeroed before caching. Similar to mask but zeros K/V instead of output.
-- **subset**: Only active (non-skipped) Q heads are computed. Groups Q heads by their KV head and runs FlashAttention per group. Provides real compute savings proportional to skipped heads.
+- **subset**: Only active (non-skipped) Q heads are computed. Groups Q heads by their KV head and runs FlashAttention per group. **Recommended for production** - provides real compute savings proportional to skipped heads.
+- **sparse_kv**: Attempts to allocate fewer KV cache heads for memory savings. **Limited by vLLM's page size unification** - only works when active KV heads divide evenly into original (1, 2, 4 for 8 KV heads). See "Sparse KV Limitations" section below.
 
 ### Generating Skip Config from Stats
 
@@ -207,9 +209,9 @@ VLLM_SKIP_SOFTMAX_MODE=mask \
 python -m vllm.entrypoints.openai.api_server --model <model>
 ```
 
-### Usage for Performance (subset mode)
+### Usage for Performance (subset mode - RECOMMENDED)
 
-Once accuracy is validated, use subset mode for real compute savings:
+Use subset mode for real compute savings in production:
 
 ```bash
 VLLM_SKIP_SOFTMAX_ENABLED=1 \
@@ -220,8 +222,13 @@ python -m vllm.entrypoints.openai.api_server --model <model>
 
 **Expected logs**:
 ```
-Skip softmax execution enabled: mode=subset (compute only active heads), 1060 heads across 37 layers configured
+Skip softmax execution enabled: mode=subset (compute only active heads (real savings)), 1060 heads across 37 layers configured
 ```
+
+**Performance Impact** (based on 120B model with 1060/2368 heads skipped = 44.8%):
+- ~45% reduction in attention compute operations
+- Throughput improvement varies by workload (prefill vs decode heavy)
+- No memory savings (full KV cache still allocated)
 
 ### Validation Workflow
 
@@ -236,15 +243,50 @@ For models with Grouped Query Attention (GQA):
 - **mask mode**: Skip mask applies directly to Q heads
 - **skip_kv mode**: KV head only skipped if ALL corresponding Q heads are skipped
 - **subset mode**: Groups active Q heads by their KV head, runs attention per KV group
+- **sparse_kv mode**: Only allocates KV heads where at least one Q head is active
+
+### Sparse KV Cache Limitations (sparse_kv mode)
+
+**Why sparse_kv doesn't provide full memory savings:**
+
+vLLM's KV cache uses a paged memory system requiring uniform page sizes across all layers. The page size is:
+```
+page_size = 2 × block_size × num_kv_heads × head_size × dtype_size
+```
+
+When layers have different `num_kv_heads` (due to sparse allocation), vLLM unifies page sizes by scaling `block_size`. This negates memory savings:
+
+| Active KV Heads | Divides 8? | Can Use Sparse? |
+|-----------------|------------|-----------------|
+| 1 | ✓ | Yes (87.5% layer savings) |
+| 2 | ✓ | Yes (75% layer savings) |
+| 3 | ✗ | No - falls back to full |
+| 4 | ✓ | Yes (50% layer savings) |
+| 5 | ✗ | No - falls back to full |
+| 6 | ✗ | No - falls back to full |
+| 7 | ✗ | No - falls back to full |
+
+**Example from 120B model** (1060 Q heads skipped across 37 layers):
+- Theoretical max: 66 KV heads skippable → 22.3% memory savings
+- Actual with constraint: 35 KV heads skippable → 11.8% memory savings
+- Lost due to page size constraint: ~10.5%
+
+**Recommendation**: Use `subset` mode for compute savings instead. Sparse KV memory savings requires deeper changes to vLLM's memory manager.
 
 ### Files Added/Modified
 
 | File | Description |
 |------|-------------|
-| `vllm/envs.py` | New env vars: `VLLM_SKIP_SOFTMAX_ENABLED`, `_CONFIG_FILE`, `_MODE` |
-| `vllm/v1/core/kv_cache_metrics.py` | `SkipHeadConfig` class for loading/managing skip config |
-| `vllm/v1/attention/backends/flash_attn.py` | Skip logic in `FlashAttentionImpl.forward()` |
+| `vllm/envs.py` | Env vars: `VLLM_SKIP_SOFTMAX_ENABLED`, `_CONFIG_FILE`, `_MODE` |
+| `vllm/v1/core/kv_cache_metrics.py` | `SkipHeadConfig` class with `get_active_head_indices()`, `get_active_kv_head_indices()`, `get_q_to_subset_kv_mapping()` |
+| `vllm/v1/attention/backends/flash_attn.py` | `_forward_with_q_subset()` for subset mode, skip logic in `forward()` |
+| `vllm/v1/kv_cache_interface.py` | `SparseAttentionSpec` class (sparse_kv branch only) |
+| `vllm/attention/layer.py` | `_get_sparse_kv_cache_spec()` method (sparse_kv branch only) |
 | `vllm/utils/generate_skip_config.py` | Utility to generate config from stats |
+
+**Branches:**
+- `skip-softmax-perf`: Production-ready subset mode for compute savings
+- `sparse-kv-cache`: Experimental sparse KV allocation (limited by page size constraints)
 
 ---
 
@@ -338,13 +380,22 @@ TRT-LLM's Skip Softmax implementation (from `/notebooks/pkgs/TensorRT-LLM/`):
 
 ### Expected Benefits
 
+**Subset Mode (Compute Savings) - RECOMMENDED:**
+
 | Optimization | Estimated Impact |
 |--------------|------------------|
-| KV cache memory savings | ~40% (888/2240 heads) |
-| Attention compute reduction | ~40% for skipped heads |
-| Overall decode speedup | 12-20% (memory-bound) |
-| Overall prefill speedup | 16-24% (compute-bound) |
-| Realistic end-to-end speedup | **15-25%** |
+| Attention compute reduction | ~45% (1060/2368 heads skipped) |
+| KV cache memory savings | None (full cache allocated) |
+| Overall speedup | Varies by workload |
+
+**Sparse KV Mode (Memory Savings) - LIMITED:**
+
+| Optimization | Theoretical | Actual (with constraints) |
+|--------------|-------------|---------------------------|
+| KV cache memory savings | ~22% | ~12% (page size constraint) |
+| Attention compute reduction | Similar to subset | Similar to subset |
+
+**Note**: Sparse KV mode provides limited benefit due to vLLM's page size unification. Use `subset` mode for production.
 
 ### Comparison with TRT-LLM Methods
 
