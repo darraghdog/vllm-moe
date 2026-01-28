@@ -35,24 +35,37 @@ def load_stats_files(stats_dir: str) -> list[dict]:
     if not stats_path.exists():
         raise FileNotFoundError(f"Stats directory not found: {stats_dir}")
 
-    # Find all JSON files matching the pattern
-    for file_path in stats_path.glob("skip_softmax_stats_*.json"):
-        try:
-            with open(file_path, "r") as f:
-                stats = json.load(f)
-                stats_files.append(stats)
-                print(f"Loaded: {file_path.name}")
-        except Exception as e:
-            print(f"Warning: Failed to load {file_path}: {e}")
+    # Find all JSON files matching various patterns
+    patterns = [
+        "skip_softmax_stats_*.json",  # Timestamped stats files
+        "skip_softmax_*.json",         # Alternative naming pattern
+    ]
+
+    loaded_files = set()
+    for pattern in patterns:
+        for file_path in stats_path.glob(pattern):
+            if file_path.name in loaded_files:
+                continue
+            try:
+                with open(file_path, "r") as f:
+                    stats = json.load(f)
+                    # Verify it has the expected structure
+                    if "per_layer_head" in stats:
+                        stats_files.append(stats)
+                        loaded_files.add(file_path.name)
+                        print(f"Loaded: {file_path.name}")
+            except Exception as e:
+                print(f"Warning: Failed to load {file_path}: {e}")
 
     # Also check for single file (non-timestamped)
     single_file = stats_path / "skip_softmax_stats.json"
-    if single_file.exists():
+    if single_file.exists() and single_file.name not in loaded_files:
         try:
             with open(single_file, "r") as f:
                 stats = json.load(f)
-                stats_files.append(stats)
-                print(f"Loaded: {single_file.name}")
+                if "per_layer_head" in stats:
+                    stats_files.append(stats)
+                    print(f"Loaded: {single_file.name}")
         except Exception as e:
             print(f"Warning: Failed to load {single_file}: {e}")
 
