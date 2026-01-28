@@ -139,9 +139,94 @@ python -m vllm.entrypoints.openai.api_server --model <model>
 
 The Triton kernel runs asynchronously but still adds overhead proportional to the sample rate.
 
-## Phase 2 TODO: Head Skipping Implementation
+## Phase 2: Skip Softmax Execution (Validation Mode)
 
-### Analysis Results (Updated 2025-01-27)
+**Status**: Implemented for accuracy validation (not performance optimized)
+
+This phase implements runtime head skipping to validate that zeroing sparse heads doesn't degrade model quality. Once accuracy is confirmed, performance optimizations can be added.
+
+### New Environment Variables
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `VLLM_SKIP_SOFTMAX_ENABLED` | bool | `0` | Enable runtime head skipping |
+| `VLLM_SKIP_SOFTMAX_CONFIG_FILE` | str | `None` | Path to skip heads JSON config |
+| `VLLM_SKIP_SOFTMAX_MODE` | str | `mask` | Mode: `mask` (zero output) or `skip_kv` (zero K/V before cache) |
+
+### Execution Modes
+
+| Mode | What it does | Performance |
+|------|--------------|-------------|
+| `mask` | Zeros output for skipped heads after attention | Slight overhead (recommended for validation) |
+| `skip_kv` | Zeros K/V before caching | Slight overhead (no bandwidth savings yet) |
+
+**Note**: Current implementation is for **validation only**. Both modes add slight overhead due to extra operations. True performance gains require deeper optimizations (sparse kernels, KV cache restructuring).
+
+### Generating Skip Config from Stats
+
+Use the utility script to aggregate collected stats and generate a config file:
+
+```bash
+python -m vllm.utils.generate_skip_config \
+    --stats-dir /path/to/stats/ \
+    --output /path/to/skip_heads_config.json \
+    --threshold 2.0 \
+    --min-sparsity 98.0
+```
+
+### Config File Format
+
+```json
+{
+  "threshold_used": 2.0,
+  "min_sparsity": 98.0,
+  "total_heads_analyzed": 2368,
+  "heads_to_skip": 1060,
+  "skip_heads": [
+    {"layer": 1, "head": 52, "sparsity_t2.0": 99.9},
+    {"layer": 7, "head": 53, "sparsity_t2.0": 99.89}
+  ],
+  "skip_mask": {
+    "1": [18, 24, 26, 27, 30, 41, 47, 52, 60],
+    "7": [0, 1, 2, 4, 5, 6, 7, ...]
+  }
+}
+```
+
+### Usage for Validation
+
+```bash
+VLLM_SKIP_SOFTMAX_ENABLED=1 \
+VLLM_SKIP_SOFTMAX_CONFIG_FILE=/path/to/skip_heads_config.json \
+VLLM_SKIP_SOFTMAX_MODE=mask \
+python -m vllm.entrypoints.openai.api_server --model <model>
+```
+
+### Validation Workflow
+
+1. **Collect stats** (Phase 1) with `VLLM_SKIP_SOFTMAX_BLOCK_ANALYSIS=1`
+2. **Generate config**: `python -m vllm.utils.generate_skip_config ...`
+3. **Run with skipping enabled**: Compare accuracy vs baseline
+4. **If accuracy OK**: Proceed to performance optimization
+
+### GQA Support
+
+For models with Grouped Query Attention (GQA):
+- **mask mode**: Skip mask applies directly to Q heads
+- **skip_kv mode**: KV head only skipped if ALL corresponding Q heads are skipped
+
+### Files Added/Modified
+
+| File | Description |
+|------|-------------|
+| `vllm/envs.py` | New env vars: `VLLM_SKIP_SOFTMAX_ENABLED`, `_CONFIG_FILE`, `_MODE` |
+| `vllm/v1/core/kv_cache_metrics.py` | `SkipHeadConfig` class for loading/managing skip config |
+| `vllm/v1/attention/backends/flash_attn.py` | Skip logic in `FlashAttentionImpl.forward()` |
+| `vllm/utils/generate_skip_config.py` | Utility to generate config from stats |
+
+---
+
+## Analysis Results (Updated 2025-01-27)
 
 Based on collected statistics from 30 stats files (threshold=2.0, 1% sampling, 53,090 sampled calls):
 
