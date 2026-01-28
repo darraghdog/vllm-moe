@@ -813,6 +813,24 @@ class FlashAttentionImpl(AttentionImpl):
                     layer_idx,
                 )
 
+            # Dynamic block-level skip softmax (TRT-LLM/BLASST style)
+            use_dynamic_skip = (
+                envs.VLLM_SKIP_SOFTMAX_DYNAMIC_ENABLED
+                and not torch.cuda.is_current_stream_capturing()
+                and dcp_world_size == 1
+                and max_seqlen_k >= envs.VLLM_SKIP_SOFTMAX_MIN_SEQLEN
+            )
+
+            if use_dynamic_skip:
+                return self._forward_with_dynamic_skip(
+                    layer,
+                    query,
+                    key_cache,
+                    value_cache,
+                    output,
+                    attn_metadata,
+                )
+
             if dcp_world_size > 1:
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
@@ -1238,6 +1256,301 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         return output
+
+    def _forward_with_dynamic_skip(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+    ) -> torch.Tensor:
+        """Forward with dynamic block-level skip softmax (TRT-LLM/BLASST style).
+
+        This method implements runtime per-block skip decisions based on the
+        BLASST/TRT-LLM threshold formula: threshold = scale_factor / seq_len
+
+        Algorithm:
+        1. Pass 1: Compute per-block max QK scores using Triton kernel
+        2. Compute skip mask using threshold formula
+        3. Find contiguous non-skipped block ranges
+        4. For each range, run FlashAttention and collect partial outputs
+        5. Combine partial outputs using online softmax
+
+        Args:
+            layer: The attention layer module
+            query: shape = [num_tokens, num_heads, head_size]
+            key_cache: shape = [num_blocks, block_size, num_kv_heads, head_size]
+            value_cache: shape = [num_blocks, block_size, num_kv_heads, head_size]
+            output: shape = [num_tokens, num_heads, head_size]
+            attn_metadata: Attention metadata
+
+        Returns:
+            output tensor
+        """
+        from vllm.attention.ops.triton_skip_softmax_analysis import (
+            skip_softmax_block_analysis,
+            compute_block_skip_mask,
+            compute_block_skip_mask_with_stats,
+            find_contiguous_ranges,
+            merge_small_ranges,
+        )
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        cu_seqlens_q = attn_metadata.query_start_loc
+        seqused_k = attn_metadata.seq_lens
+        max_seqlen_q = attn_metadata.max_query_len
+        max_seqlen_k = attn_metadata.max_seq_len
+        block_table = attn_metadata.block_table
+        block_size = attn_metadata.block_size
+
+        # Determine scale factor based on whether this is prefill or decode
+        is_prefill = max_seqlen_q > 1
+        scale_factor = (
+            envs.VLLM_SKIP_SOFTMAX_SCALE_FACTOR_PREFILL if is_prefill
+            else envs.VLLM_SKIP_SOFTMAX_SCALE_FACTOR_DECODE
+        )
+
+        # Pass 1: Compute per-block max QK scores
+        block_max_scores = skip_softmax_block_analysis(
+            query=query[:num_actual_tokens],
+            key_cache=key_cache,
+            block_table=block_table,
+            seq_lens=seqused_k,
+            query_start_loc=cu_seqlens_q,
+            scale=self.scale,
+            block_size=block_size,
+        )
+
+        # Compute skip mask and optionally log statistics
+        if envs.VLLM_SKIP_SOFTMAX_LOG_SPARSITY:
+            skip_mask, stats = compute_block_skip_mask_with_stats(
+                block_max_scores=block_max_scores,
+                seq_lens=seqused_k,
+                scale_factor=scale_factor,
+                block_size=block_size,
+            )
+            layer_idx = getattr(layer, 'layer_idx', -1)
+            logger.info(
+                "Dynamic skip softmax layer=%d: sparsity=%.1f%% "
+                "(%d/%d blocks skipped), scale_factor=%.1f, is_prefill=%s",
+                layer_idx,
+                stats['sparsity_pct'],
+                stats['skipped_blocks'],
+                stats['total_blocks'],
+                scale_factor,
+                is_prefill,
+            )
+        else:
+            skip_mask = compute_block_skip_mask(
+                block_max_scores=block_max_scores,
+                seq_lens=seqused_k,
+                scale_factor=scale_factor,
+                block_size=block_size,
+            )
+
+        # Check sparsity - if too low, fall back to full attention
+        # (overhead of block-sparse not worth it)
+        num_seqs = seqused_k.shape[0]
+        num_heads = query.shape[1]
+        max_num_blocks = block_table.shape[1]
+
+        # Count valid blocks
+        block_indices = torch.arange(max_num_blocks, device=query.device).view(1, -1, 1)
+        num_blocks_per_seq = (seqused_k.view(-1, 1, 1) + block_size - 1) // block_size
+        valid_mask = block_indices < num_blocks_per_seq
+
+        total_valid = valid_mask.sum().item()
+        total_skipped = (skip_mask & valid_mask).sum().item()
+        sparsity = total_skipped / total_valid if total_valid > 0 else 0.0
+
+        # If sparsity is less than 30%, use full attention (overhead not worth it)
+        if sparsity < 0.3:
+            return self._forward_full_attention(
+                layer, query, key_cache, value_cache, output, attn_metadata
+            )
+
+        # For now, we implement a simplified version that processes sequences
+        # one at a time with their specific block ranges. This is less efficient
+        # than a fully fused kernel but demonstrates the approach.
+        #
+        # TODO: Implement a more efficient batched version that groups sequences
+        # with similar sparsity patterns.
+
+        descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+
+        # Process each sequence
+        for seq_idx in range(num_seqs):
+            seq_len = seqused_k[seq_idx].item()
+            num_blocks = (seq_len + block_size - 1) // block_size
+
+            if num_blocks == 0:
+                continue
+
+            # Get query range for this sequence
+            q_start = cu_seqlens_q[seq_idx].item()
+            q_end = cu_seqlens_q[seq_idx + 1].item()
+
+            if q_end <= q_start:
+                continue
+
+            # Get this sequence's skip mask (average across heads for simplicity)
+            # A block is considered non-skipped if ANY head needs it
+            seq_skip_mask = skip_mask[seq_idx, :num_blocks, :].any(dim=1)  # [num_blocks]
+
+            # Find contiguous ranges of non-skipped blocks
+            ranges = find_contiguous_ranges(~seq_skip_mask)  # Invert: False = skip
+
+            if not ranges:
+                # All blocks skipped (shouldn't happen due to first block rule)
+                output[q_start:q_end, :, :] = 0.0
+                continue
+
+            # Merge small gaps to reduce kernel launch overhead
+            ranges = merge_small_ranges(ranges, min_gap=2)
+
+            # If only one range covering all blocks, use full attention
+            if len(ranges) == 1 and ranges[0] == (0, num_blocks):
+                # Single sequence full attention
+                seq_q = query[q_start:q_end, :, :]
+                seq_out = output[q_start:q_end, :, :]
+                seq_block_table = block_table[seq_idx:seq_idx+1, :num_blocks]
+                seq_seqused_k = seqused_k[seq_idx:seq_idx+1]
+                seq_cu_seqlens_q = torch.tensor([0, q_end - q_start], device=query.device, dtype=torch.int32)
+
+                flash_attn_varlen_func(
+                    q=seq_q,
+                    k=key_cache,
+                    v=value_cache,
+                    out=seq_out,
+                    cu_seqlens_q=seq_cu_seqlens_q,
+                    max_seqlen_q=q_end - q_start,
+                    seqused_k=seq_seqused_k,
+                    max_seqlen_k=seq_len,
+                    softmax_scale=self.scale,
+                    causal=attn_metadata.causal,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=seq_block_table,
+                    softcap=self.logits_soft_cap,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=layer._q_scale.expand(1, self.num_kv_heads),
+                    k_descale=layer._k_scale.expand(1, self.num_kv_heads),
+                    v_descale=layer._v_scale.expand(1, self.num_kv_heads),
+                    num_splits=0,
+                    s_aux=self.sinks,
+                )
+                continue
+
+            # Multiple ranges: process each and combine with online softmax
+            seq_q = query[q_start:q_end, :, :]
+            num_q_tokens = q_end - q_start
+
+            partial_outputs = []  # List of (output, lse) tuples
+
+            for range_start, range_end in ranges:
+                # Create block table for this range
+                range_block_table = block_table[seq_idx:seq_idx+1, range_start:range_end]
+
+                # Compute seqused_k for this range
+                # The range covers blocks [range_start, range_end)
+                range_kv_start = range_start * block_size
+                range_kv_end = min(range_end * block_size, seq_len)
+                range_seqused_k = torch.tensor([range_kv_end - range_kv_start], device=query.device, dtype=seqused_k.dtype)
+
+                seq_cu_seqlens_q = torch.tensor([0, num_q_tokens], device=query.device, dtype=torch.int32)
+
+                # Run attention for this range
+                partial_out, partial_lse = flash_attn_varlen_func(
+                    q=seq_q,
+                    k=key_cache,
+                    v=value_cache,
+                    out=None,  # Let FA allocate output
+                    cu_seqlens_q=seq_cu_seqlens_q,
+                    max_seqlen_q=num_q_tokens,
+                    seqused_k=range_seqused_k,
+                    max_seqlen_k=range_kv_end - range_kv_start,
+                    softmax_scale=self.scale,
+                    causal=attn_metadata.causal if range_end * block_size >= seq_len else False,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=range_block_table,
+                    softcap=self.logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=layer._q_scale.expand(1, self.num_kv_heads),
+                    k_descale=layer._k_scale.expand(1, self.num_kv_heads),
+                    v_descale=layer._v_scale.expand(1, self.num_kv_heads),
+                    num_splits=0,
+                )
+                partial_outputs.append((partial_out, partial_lse))
+
+            # Combine partial outputs using online softmax
+            if len(partial_outputs) == 1:
+                output[q_start:q_end, :, :] = partial_outputs[0][0]
+            else:
+                # Online softmax combination
+                # out = sum(out_i * exp(lse_i - max_lse)) / sum(exp(lse_i - max_lse))
+                combined_out = self._combine_partial_outputs(partial_outputs)
+                output[q_start:q_end, :, :] = combined_out
+
+        return output
+
+    def _combine_partial_outputs(
+        self,
+        partial_outputs: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Combine partial attention outputs using online softmax.
+
+        Each partial output has its own LSE (log-sum-exp).
+        The combined output is:
+            out = sum(out_i * exp(lse_i)) / sum(exp(lse_i))
+                = sum(out_i * exp(lse_i - max_lse)) / sum(exp(lse_i - max_lse))
+
+        Args:
+            partial_outputs: List of (output, lse) tuples
+                output shape: [num_tokens, num_heads, head_dim]
+                lse shape: [num_heads, num_tokens] (FA returns this shape)
+
+        Returns:
+            Combined output tensor of shape [num_tokens, num_heads, head_dim]
+        """
+        if len(partial_outputs) == 1:
+            return partial_outputs[0][0]
+
+        # Stack all LSEs to find max for numerical stability
+        # FA returns LSE in shape [num_heads, num_tokens]
+        all_lse = torch.stack([lse for _, lse in partial_outputs], dim=0)  # [num_ranges, num_heads, num_tokens]
+        max_lse = all_lse.max(dim=0).values  # [num_heads, num_tokens]
+
+        # Compute weights: exp(lse_i - max_lse)
+        # Transpose to [num_tokens, num_heads] for broadcasting with outputs
+        max_lse_t = max_lse.transpose(0, 1)  # [num_tokens, num_heads]
+
+        numerator = None
+        denominator = None
+
+        for out, lse in partial_outputs:
+            # lse shape: [num_heads, num_tokens] -> [num_tokens, num_heads]
+            lse_t = lse.transpose(0, 1)
+            weight = torch.exp(lse_t - max_lse_t)  # [num_tokens, num_heads]
+            weight = weight.unsqueeze(-1)  # [num_tokens, num_heads, 1]
+
+            weighted_out = out * weight
+
+            if numerator is None:
+                numerator = weighted_out
+                denominator = weight
+            else:
+                numerator = numerator + weighted_out
+                denominator = denominator + weight
+
+        # Avoid division by zero
+        denominator = denominator.clamp(min=1e-10)
+        combined = numerator / denominator
+
+        return combined
 
     def _forward_encoder_attention(
         self,

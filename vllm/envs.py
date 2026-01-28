@@ -57,6 +57,12 @@ if TYPE_CHECKING:
     VLLM_SKIP_SOFTMAX_ENABLED: bool = False
     VLLM_SKIP_SOFTMAX_CONFIG_FILE: str | None = None
     VLLM_SKIP_SOFTMAX_MODE: str = "mask"  # "mask", "skip_kv", or "subset"
+    # Dynamic block-level skip softmax (TRT-LLM/BLASST style)
+    VLLM_SKIP_SOFTMAX_DYNAMIC_ENABLED: bool = False
+    VLLM_SKIP_SOFTMAX_SCALE_FACTOR_PREFILL: float = 1000.0
+    VLLM_SKIP_SOFTMAX_SCALE_FACTOR_DECODE: float = 500.0
+    VLLM_SKIP_SOFTMAX_LOG_SPARSITY: bool = False
+    VLLM_SKIP_SOFTMAX_MIN_SEQLEN: int = 256
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_ATTENTION_BACKEND: str | None = None
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
@@ -693,6 +699,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "subset" (compute only active heads for real compute savings)
     "VLLM_SKIP_SOFTMAX_MODE": lambda: os.getenv(
         "VLLM_SKIP_SOFTMAX_MODE", "mask"
+    ),
+    # Dynamic block-level skip softmax (TRT-LLM/BLASST style)
+    # Enable dynamic per-block skip decisions at runtime
+    "VLLM_SKIP_SOFTMAX_DYNAMIC_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_SKIP_SOFTMAX_DYNAMIC_ENABLED", "0"))
+    ),
+    # Scale factor for threshold calculation: threshold = scale_factor / seq_len
+    # Higher values = more aggressive skipping
+    "VLLM_SKIP_SOFTMAX_SCALE_FACTOR_PREFILL": lambda: float(
+        os.getenv("VLLM_SKIP_SOFTMAX_SCALE_FACTOR_PREFILL", "1000.0")
+    ),
+    "VLLM_SKIP_SOFTMAX_SCALE_FACTOR_DECODE": lambda: float(
+        os.getenv("VLLM_SKIP_SOFTMAX_SCALE_FACTOR_DECODE", "500.0")
+    ),
+    # Log sparsity statistics for debugging
+    "VLLM_SKIP_SOFTMAX_LOG_SPARSITY": lambda: bool(
+        int(os.getenv("VLLM_SKIP_SOFTMAX_LOG_SPARSITY", "0"))
+    ),
+    # Minimum sequence length to enable dynamic skip (shorter seqs use full attention)
+    "VLLM_SKIP_SOFTMAX_MIN_SEQLEN": lambda: int(
+        os.getenv("VLLM_SKIP_SOFTMAX_MIN_SEQLEN", "256")
     ),
     # Trace function calls
     # If set to 1, vllm will trace function calls

@@ -468,3 +468,194 @@ def compute_skip_softmax_sparsity_multi_threshold(
         per_head_at_threshold[h] = head_skippable_at_thresh
 
     return per_head_total, per_head_at_threshold
+
+
+def compute_block_skip_mask(
+    block_max_scores: torch.Tensor,  # [num_seqs, max_num_blocks, num_heads]
+    seq_lens: torch.Tensor,  # [num_seqs]
+    scale_factor: float,
+    block_size: int = 16,
+) -> torch.Tensor:
+    """Compute dynamic block skip mask using BLASST/TRT-LLM threshold formula.
+
+    The threshold formula is: threshold = scale_factor / seq_len
+    A block is skipped if: local_max < running_global_max - ln(threshold)
+
+    This implements the online softmax style decision where we track the running
+    maximum and decide whether to skip based on how far the local max is from
+    the current global max.
+
+    Args:
+        block_max_scores: Per-block max QK scores [num_seqs, max_num_blocks, num_heads]
+        seq_lens: Sequence lengths [num_seqs]
+        scale_factor: Scale factor for threshold (higher = more aggressive skipping)
+        block_size: KV cache block size
+
+    Returns:
+        skip_mask: Boolean tensor [num_seqs, max_num_blocks, num_heads]
+                   True = skip this block, False = compute this block
+    """
+    num_seqs, max_num_blocks, num_heads = block_max_scores.shape
+    device = block_max_scores.device
+
+    # Compute dynamic threshold per sequence: threshold = scale_factor / seq_len
+    # ln(threshold) = ln(scale_factor) - ln(seq_len)
+    seq_lens_float = seq_lens.float().clamp(min=1.0)  # Avoid div by zero
+    thresholds = scale_factor / seq_lens_float  # [num_seqs]
+    ln_threshold = torch.log(thresholds).view(num_seqs, 1, 1)  # [num_seqs, 1, 1]
+
+    # Compute running max across KV blocks (simulates online softmax)
+    # For each position, the running max is the max of all blocks up to that point
+    # cummax returns (values, indices), we only need values
+    running_max, _ = torch.cummax(block_max_scores, dim=1)  # [num_seqs, max_num_blocks, num_heads]
+
+    # For the skip decision, we compare current block's max against the previous running max
+    # Shift running_max right by 1 (pad with -inf at start)
+    prev_running_max = torch.full_like(running_max, float('-inf'))
+    prev_running_max[:, 1:, :] = running_max[:, :-1, :]
+
+    # Skip condition: block_max < prev_running_max - ln(threshold)
+    # This means the block's contribution to softmax is negligible
+    skip_threshold = prev_running_max - ln_threshold
+    skip_mask = block_max_scores < skip_threshold
+
+    # Mask out invalid blocks (beyond sequence length)
+    # Create a mask for valid blocks
+    block_indices = torch.arange(max_num_blocks, device=device).view(1, -1, 1)
+    num_blocks_per_seq = (seq_lens.view(-1, 1, 1) + block_size - 1) // block_size
+    valid_mask = block_indices < num_blocks_per_seq
+
+    # Only consider skip for valid blocks; invalid blocks marked as skip
+    # (they won't be processed anyway)
+    skip_mask = skip_mask | ~valid_mask
+
+    # Never skip the first block (it sets the initial running max)
+    skip_mask[:, 0, :] = False
+
+    return skip_mask
+
+
+def compute_block_skip_mask_with_stats(
+    block_max_scores: torch.Tensor,  # [num_seqs, max_num_blocks, num_heads]
+    seq_lens: torch.Tensor,  # [num_seqs]
+    scale_factor: float,
+    block_size: int = 16,
+) -> tuple[torch.Tensor, dict]:
+    """Compute block skip mask and return sparsity statistics.
+
+    Same as compute_block_skip_mask but also returns statistics about
+    how many blocks are being skipped.
+
+    Args:
+        block_max_scores: Per-block max QK scores [num_seqs, max_num_blocks, num_heads]
+        seq_lens: Sequence lengths [num_seqs]
+        scale_factor: Scale factor for threshold
+        block_size: KV cache block size
+
+    Returns:
+        skip_mask: Boolean tensor [num_seqs, max_num_blocks, num_heads]
+        stats: Dictionary with sparsity statistics
+    """
+    skip_mask = compute_block_skip_mask(
+        block_max_scores, seq_lens, scale_factor, block_size
+    )
+
+    num_seqs, max_num_blocks, num_heads = block_max_scores.shape
+    device = block_max_scores.device
+
+    # Count valid blocks per sequence
+    block_indices = torch.arange(max_num_blocks, device=device).view(1, -1, 1)
+    num_blocks_per_seq = (seq_lens.view(-1, 1, 1) + block_size - 1) // block_size
+    valid_mask = block_indices < num_blocks_per_seq
+
+    # Count total valid blocks and skipped blocks
+    total_valid_blocks = valid_mask.sum().item()
+    skipped_blocks = (skip_mask & valid_mask).sum().item()
+    computed_blocks = total_valid_blocks - skipped_blocks
+
+    sparsity_pct = (skipped_blocks / total_valid_blocks * 100) if total_valid_blocks > 0 else 0.0
+
+    stats = {
+        'total_blocks': total_valid_blocks,
+        'skipped_blocks': skipped_blocks,
+        'computed_blocks': computed_blocks,
+        'sparsity_pct': sparsity_pct,
+        'scale_factor': scale_factor,
+        'num_seqs': num_seqs,
+        'num_heads': num_heads,
+    }
+
+    return skip_mask, stats
+
+
+def find_contiguous_ranges(
+    skip_mask: torch.Tensor,  # [max_num_blocks] boolean
+) -> list[tuple[int, int]]:
+    """Find contiguous ranges of non-skipped blocks.
+
+    Args:
+        skip_mask: Boolean tensor where True = skip, False = compute
+
+    Returns:
+        List of (start, end) tuples for contiguous non-skipped ranges.
+        Each range is [start, end) (end is exclusive).
+    """
+    ranges = []
+    n = skip_mask.shape[0]
+
+    # Convert to CPU for iteration
+    mask_cpu = skip_mask.cpu().numpy()
+
+    in_range = False
+    start = 0
+
+    for i in range(n):
+        if not mask_cpu[i]:  # Not skipped
+            if not in_range:
+                start = i
+                in_range = True
+        else:  # Skipped
+            if in_range:
+                ranges.append((start, i))
+                in_range = False
+
+    # Handle case where range extends to end
+    if in_range:
+        ranges.append((start, n))
+
+    return ranges
+
+
+def merge_small_ranges(
+    ranges: list[tuple[int, int]],
+    min_gap: int = 1,
+) -> list[tuple[int, int]]:
+    """Merge ranges that are separated by small gaps.
+
+    When gaps between ranges are small, the overhead of multiple kernel
+    launches may exceed the benefit of skipping those blocks. This function
+    merges ranges separated by gaps smaller than min_gap.
+
+    Args:
+        ranges: List of (start, end) tuples
+        min_gap: Minimum gap size to keep ranges separate
+
+    Returns:
+        Merged list of ranges
+    """
+    if len(ranges) <= 1:
+        return ranges
+
+    merged = [ranges[0]]
+
+    for start, end in ranges[1:]:
+        prev_start, prev_end = merged[-1]
+        gap = start - prev_end
+
+        if gap <= min_gap:
+            # Merge with previous range
+            merged[-1] = (prev_start, end)
+        else:
+            merged.append((start, end))
+
+    return merged
