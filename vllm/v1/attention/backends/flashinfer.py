@@ -570,6 +570,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 "passing --block-size 32 or --block-size 64."
             )
 
+        # Block usage tracking for cache utilization analysis
+        self.block_usage_collector = None
+        if envs.VLLM_BLOCK_USAGE_STATS:
+            from vllm.v1.core.kv_cache_metrics import BlockUsageCollector
+
+            self.block_usage_collector = BlockUsageCollector(
+                enabled=True,
+                log_interval=envs.VLLM_BLOCK_USAGE_LOG_INTERVAL,
+            )
+
     @classmethod
     def get_cudagraph_support(
         cls: type["FlashInferMetadataBuilder"],
@@ -968,6 +978,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.decode_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
+
+        # Record block usage statistics if enabled
+        if self.block_usage_collector is not None:
+            self.block_usage_collector.record_batch_blocks(
+                common_attn_metadata.block_table_tensor,
+                num_reqs,
+                common_attn_metadata.seq_lens,
+                self.page_size,
+            )
+
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:

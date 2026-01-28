@@ -8,7 +8,7 @@ from typing import ClassVar, Optional
 
 import torch
 
-from vllm import _custom_ops as ops
+from vllm import _custom_ops as ops, envs
 from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
@@ -170,6 +170,16 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
 
         self.reorder_batch_threshold = self.tree_attn_bias.shape[0]
 
+        # Block usage tracking for cache utilization analysis
+        self.block_usage_collector = None
+        if envs.VLLM_BLOCK_USAGE_STATS:
+            from vllm.v1.core.kv_cache_metrics import BlockUsageCollector
+
+            self.block_usage_collector = BlockUsageCollector(
+                enabled=True,
+                log_interval=envs.VLLM_BLOCK_USAGE_LOG_INTERVAL,
+            )
+
     def build(
         self,
         common_prefix_len: int,
@@ -183,6 +193,7 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
             )
         )
 
+        num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         q_start_loc = common_attn_metadata.query_start_loc
         max_query_len = common_attn_metadata.max_query_len
@@ -190,6 +201,15 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
         max_seq_len = common_attn_metadata.max_seq_len
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+
+        # Record block usage statistics if enabled
+        if self.block_usage_collector is not None:
+            self.block_usage_collector.record_batch_blocks(
+                block_table,
+                num_reqs,
+                kv_seqlens,
+                self.block_size,
+            )
 
         return TreeAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
