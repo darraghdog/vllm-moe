@@ -564,11 +564,14 @@ def compute_block_skip_mask_with_stats(
     device = block_max_scores.device
 
     # Count valid blocks per sequence
+    # valid_mask needs same shape as skip_mask for correct counting
     block_indices = torch.arange(max_num_blocks, device=device).view(1, -1, 1)
     num_blocks_per_seq = (seq_lens.view(-1, 1, 1) + block_size - 1) // block_size
     valid_mask = block_indices < num_blocks_per_seq
+    # Expand to [num_seqs, max_num_blocks, num_heads] for correct counting
+    valid_mask = valid_mask.expand(-1, -1, num_heads)
 
-    # Count total valid blocks and skipped blocks
+    # Count total valid blocks and skipped blocks (across all seqs, blocks, heads)
     total_valid_blocks = valid_mask.sum().item()
     skipped_blocks = (skip_mask & valid_mask).sum().item()
     computed_blocks = total_valid_blocks - skipped_blocks
@@ -576,9 +579,9 @@ def compute_block_skip_mask_with_stats(
     sparsity_pct = (skipped_blocks / total_valid_blocks * 100) if total_valid_blocks > 0 else 0.0
 
     stats = {
-        'total_blocks': total_valid_blocks,
-        'skipped_blocks': skipped_blocks,
-        'computed_blocks': computed_blocks,
+        'total_blocks': int(total_valid_blocks),
+        'skipped_blocks': int(skipped_blocks),
+        'computed_blocks': int(computed_blocks),
         'sparsity_pct': sparsity_pct,
         'scale_factor': scale_factor,
         'num_seqs': num_seqs,
