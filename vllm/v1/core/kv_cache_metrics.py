@@ -549,6 +549,24 @@ class SkipSoftmaxBlockAnalyzer:
             if self.output_file:
                 self._write_stats_to_file(layer_head_data, total_blocks, total_skippable)
 
+    def _get_output_path(self) -> str:
+        """Get the output file path, creating timestamped file if output_file is a directory.
+
+        If output_file ends with '/' or is a directory, create timestamped files inside it.
+        Otherwise, return output_file as-is (overwrite mode).
+        """
+        import os
+        from datetime import datetime
+
+        if self.output_file.endswith('/') or os.path.isdir(self.output_file):
+            # Create directory if needed
+            os.makedirs(self.output_file.rstrip('/'), exist_ok=True)
+            # Generate timestamped filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            return os.path.join(self.output_file.rstrip('/'), f"skip_softmax_stats_{timestamp}.json")
+        else:
+            return self.output_file
+
     def _write_stats_to_file(
         self,
         layer_head_data: dict[tuple[int | None, int], dict],
@@ -561,6 +579,9 @@ class SkipSoftmaxBlockAnalyzer:
             layer_head_data: Dict mapping (layer_idx, head_idx) to stats dict
             total_blocks: Total blocks across all layer/heads
             total_skippable: Total skippable blocks at primary threshold
+
+        If output_file ends with '/' or is a directory, saves timestamped files
+        instead of overwriting. This allows accumulating stats across restarts.
         """
         try:
             overall_sparsity = 100.0 * total_skippable / total_blocks if total_blocks > 0 else 0.0
@@ -617,11 +638,13 @@ class SkipSoftmaxBlockAnalyzer:
                     },
                 }
 
-            # Write to file (overwrite each time)
-            with open(self.output_file, "w") as f:
+            # Get output path (may be timestamped if output_file is a directory)
+            output_path = self._get_output_path()
+
+            with open(output_path, "w") as f:
                 json.dump(stats, f, indent=2)
 
-            logger.info("Wrote skip softmax stats to %s", self.output_file)
+            logger.info("Wrote skip softmax stats to %s", output_path)
         except Exception as e:
             logger.warning("Failed to write skip softmax stats to file: %s", e)
 
