@@ -781,6 +781,12 @@ class FlashAttentionImpl(AttentionImpl):
             block_table = attn_metadata.block_table
             scheduler_metadata = attn_metadata.scheduler_metadata
 
+            # Get DCP world size from parallel state (not stored on impl)
+            try:
+                dcp_world_size = get_dcp_group().world_size
+            except AssertionError:
+                dcp_world_size = 1
+
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
             # Subset mode: compute only active Q heads for real compute savings
@@ -793,7 +799,7 @@ class FlashAttentionImpl(AttentionImpl):
                 and layer_idx is not None
                 and skip_config.should_skip_layer(layer_idx)
                 and not torch.cuda.is_current_stream_capturing()
-                and self.dcp_world_size == 1  # Not supported with DCP yet
+                and dcp_world_size == 1  # Not supported with DCP yet
             )
 
             if use_subset:
@@ -807,7 +813,7 @@ class FlashAttentionImpl(AttentionImpl):
                     layer_idx,
                 )
 
-            if self.dcp_world_size > 1:
+            if dcp_world_size > 1:
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
                     key[:num_actual_tokens],
