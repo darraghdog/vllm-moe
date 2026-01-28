@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     # Skip softmax execution configuration
     VLLM_SKIP_SOFTMAX_ENABLED: bool = False
     VLLM_SKIP_SOFTMAX_CONFIG_FILE: str | None = None
-    VLLM_SKIP_SOFTMAX_MODE: str = "mask"  # "mask" or "skip_kv"
+    VLLM_SKIP_SOFTMAX_MODE: str = "mask"  # "mask", "skip_kv", or "subset"
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_ATTENTION_BACKEND: str | None = None
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
@@ -687,7 +687,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SKIP_SOFTMAX_CONFIG_FILE": lambda: os.getenv(
         "VLLM_SKIP_SOFTMAX_CONFIG_FILE"
     ),
-    # Skip softmax mode: "mask" (zero output) or "skip_kv" (zero K/V before cache)
+    # Skip softmax mode:
+    # - "mask" (zero output after attention)
+    # - "skip_kv" (zero K/V before cache)
+    # - "subset" (compute only active heads for real compute savings)
     "VLLM_SKIP_SOFTMAX_MODE": lambda: os.getenv(
         "VLLM_SKIP_SOFTMAX_MODE", "mask"
     ),

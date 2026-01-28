@@ -370,9 +370,20 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
             self.skip_head_config = SkipHeadConfig.get_instance()
             if self.skip_head_config.enabled:
+                total_skip_heads = sum(
+                    len(h) for h in self.skip_head_config.skip_heads.values()
+                )
+                mode_desc = {
+                    "mask": "zero output after attention",
+                    "skip_kv": "zero K/V before caching",
+                    "subset": "compute only active heads (real savings)",
+                }.get(self.skip_head_config.mode, self.skip_head_config.mode)
                 logger.info(
-                    "Skip softmax execution enabled: mode=%s, %d layers configured",
+                    "Skip softmax execution enabled: mode=%s (%s), "
+                    "%d heads across %d layers configured",
                     self.skip_head_config.mode,
+                    mode_desc,
+                    total_skip_heads,
                     len(self.skip_head_config.skip_heads),
                 )
 
@@ -772,6 +783,30 @@ class FlashAttentionImpl(AttentionImpl):
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
+            # Subset mode: compute only active Q heads for real compute savings
+            skip_config = attn_metadata.skip_head_config
+            layer_idx = getattr(layer, "layer_idx", None)
+            use_subset = (
+                skip_config is not None
+                and skip_config.enabled
+                and skip_config.mode == "subset"
+                and layer_idx is not None
+                and skip_config.should_skip_layer(layer_idx)
+                and not torch.cuda.is_current_stream_capturing()
+                and self.dcp_world_size == 1  # Not supported with DCP yet
+            )
+
+            if use_subset:
+                return self._forward_with_q_subset(
+                    layer,
+                    query,
+                    key_cache,
+                    value_cache,
+                    output,
+                    attn_metadata,
+                    layer_idx,
+                )
+
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
@@ -1018,6 +1053,185 @@ class FlashAttentionImpl(AttentionImpl):
             query_attn_out,
             query_lse,
         )
+
+    def _forward_with_q_subset(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """Forward with only active Q heads computed (subset mode - Phase 1).
+
+        Phase 1: Q-only subsetting with full KV cache.
+        This provides compute savings proportional to the number of skipped Q heads.
+
+        Strategy: Group active Q heads by their corresponding KV head and process
+        each KV group together. This maintains correct GQA mapping while allowing
+        us to skip inactive heads.
+
+        For example, with 64 Q heads and 8 KV heads (8 Q per KV):
+        - If Q heads [0, 1, 5, 6, 7] are active (in KV group 0)
+        - We run attention with those 5 Q heads against KV head 0
+        - FlashAttention sees this as 5:1 GQA ratio
+
+        Args:
+            layer: The attention layer module.
+            query: shape = [num_tokens, num_heads, head_size]
+            key_cache: shape = [num_blocks, block_size, num_kv_heads, head_size]
+            value_cache: shape = [num_blocks, block_size, num_kv_heads, head_size]
+            output: shape = [num_tokens, num_heads, head_size]
+            attn_metadata: Attention metadata.
+            layer_idx: Layer index for skip config lookup.
+
+        Returns:
+            output tensor with skipped heads zeroed.
+        """
+        skip_config = attn_metadata.skip_head_config
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        # Get active Q head indices
+        active_q_indices = skip_config.get_active_head_indices(
+            layer_idx, self.num_heads, query.device
+        )
+        num_active_q = active_q_indices.shape[0]
+
+        # If all heads are active, fall back to normal path
+        if num_active_q == self.num_heads:
+            return self._forward_full_attention(
+                layer, query, key_cache, value_cache, output, attn_metadata
+            )
+
+        # If no heads are active, just zero output and return
+        if num_active_q == 0:
+            output[:num_actual_tokens, :, :] = 0.0
+            return output
+
+        cu_seqlens_q = attn_metadata.query_start_loc
+        seqused_k = attn_metadata.seq_lens
+        max_seqlen_q = attn_metadata.max_query_len
+        max_seqlen_k = attn_metadata.max_seq_len
+        block_table = attn_metadata.block_table
+
+        # Zero output first (skipped heads = 0)
+        output[:num_actual_tokens, :, :] = 0.0
+
+        # Group active Q heads by their KV head
+        heads_per_kv = self.num_heads // self.num_kv_heads
+        active_q_list = active_q_indices.tolist()
+
+        # Build groups: kv_idx -> list of q_indices
+        kv_groups: dict[int, list[int]] = {}
+        for q_idx in active_q_list:
+            kv_idx = q_idx // heads_per_kv
+            if kv_idx not in kv_groups:
+                kv_groups[kv_idx] = []
+            kv_groups[kv_idx].append(q_idx)
+
+        # Process each KV group
+        for kv_idx, q_indices in kv_groups.items():
+            num_q_in_group = len(q_indices)
+
+            # Extract Q heads for this group
+            # Convert to tensor for indexing
+            q_idx_tensor = torch.tensor(q_indices, device=query.device, dtype=torch.long)
+            q_group = query[:num_actual_tokens, q_idx_tensor, :]  # [tokens, num_q, head_dim]
+
+            # Extract single KV head: [num_blocks, block_size, 1, head_dim]
+            k_single = key_cache[:, :, kv_idx:kv_idx+1, :]
+            v_single = value_cache[:, :, kv_idx:kv_idx+1, :]
+
+            # Output buffer for this group
+            out_group = torch.empty(
+                num_actual_tokens, num_q_in_group, self.head_size,
+                dtype=query.dtype, device=query.device
+            )
+
+            descale_shape = (cu_seqlens_q.shape[0] - 1, 1)
+
+            # Run attention with N Q heads against 1 KV head
+            # FlashAttention interprets this as N:1 GQA
+            flash_attn_varlen_func(
+                q=q_group,
+                k=k_single,
+                v=v_single,
+                out=out_group,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=None,  # Not supported with head subsetting
+                window_size=self.sliding_window,
+                block_table=block_table,
+                softcap=self.logits_soft_cap,
+                scheduler_metadata=None,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=layer._q_scale.expand(descale_shape),
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+                num_splits=0,
+                s_aux=None,  # Not supported with head subsetting
+            )
+
+            # Scatter results back to correct output positions
+            output[:num_actual_tokens, q_idx_tensor, :] = out_group
+
+        return output
+
+    def _forward_full_attention(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+    ) -> torch.Tensor:
+        """Full attention path (no head skipping).
+
+        This is a helper to avoid code duplication when subset mode
+        determines all heads are active.
+        """
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        cu_seqlens_q = attn_metadata.query_start_loc
+        seqused_k = attn_metadata.seq_lens
+        max_seqlen_q = attn_metadata.max_query_len
+        max_seqlen_k = attn_metadata.max_seq_len
+        block_table = attn_metadata.block_table
+        scheduler_metadata = attn_metadata.scheduler_metadata
+
+        descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+
+        flash_attn_varlen_func(
+            q=query[:num_actual_tokens],
+            k=key_cache,
+            v=value_cache,
+            out=output[:num_actual_tokens],
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=self.alibi_slopes,
+            window_size=self.sliding_window,
+            block_table=block_table,
+            softcap=self.logits_soft_cap,
+            scheduler_metadata=scheduler_metadata,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=layer._q_scale.expand(descale_shape),
+            k_descale=layer._k_scale.expand(descale_shape),
+            v_descale=layer._v_scale.expand(descale_shape),
+            num_splits=attn_metadata.max_num_splits,
+            s_aux=self.sinks,
+        )
+
+        return output
 
     def _forward_encoder_attention(
         self,

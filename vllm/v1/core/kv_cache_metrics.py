@@ -808,6 +808,74 @@ class SkipHeadConfig:
         """Check if any heads should be skipped in this layer."""
         return layer_idx in self.skip_heads and len(self.skip_heads[layer_idx]) > 0
 
+    def get_active_head_indices(
+        self, layer_idx: int, num_heads: int, device: torch.device
+    ) -> torch.Tensor:
+        """Get indices of active (non-skipped) Q heads.
+
+        Args:
+            layer_idx: Layer index.
+            num_heads: Number of Q heads.
+            device: Device to create tensor on.
+
+        Returns:
+            Long tensor of active head indices, e.g., [0, 2, 3, 5, ...] for heads
+            where head 1 and 4 are skipped.
+        """
+        skip_mask = self.get_skip_mask(layer_idx, num_heads, device)
+        return torch.where(~skip_mask)[0]
+
+    def get_active_kv_head_indices(
+        self, layer_idx: int, num_q_heads: int, num_kv_heads: int, device: torch.device
+    ) -> torch.Tensor:
+        """Get indices of active KV heads (for GQA).
+
+        A KV head is active if ANY of its corresponding Q heads are active.
+
+        Args:
+            layer_idx: Layer index.
+            num_q_heads: Number of Q heads.
+            num_kv_heads: Number of KV heads.
+            device: Device to create tensor on.
+
+        Returns:
+            Long tensor of active KV head indices.
+        """
+        kv_skip_mask = self.get_kv_skip_mask(layer_idx, num_q_heads, num_kv_heads, device)
+        return torch.where(~kv_skip_mask)[0]
+
+    def get_q_to_subset_kv_mapping(
+        self,
+        active_q_indices: torch.Tensor,
+        num_q_heads: int,
+        num_kv_heads: int,
+    ) -> torch.Tensor:
+        """Map active Q head indices to their KV head indices in the SUBSET.
+
+        For GQA, multiple Q heads share a single KV head. This method returns
+        the index into the SUBSET of active KV heads for each active Q head.
+
+        Args:
+            active_q_indices: Tensor of active Q head indices.
+            num_q_heads: Total number of Q heads.
+            num_kv_heads: Total number of KV heads.
+
+        Returns:
+            Tensor mapping each active Q to its KV head index in the subset.
+            Shape: [num_active_q]
+        """
+        if num_q_heads == num_kv_heads:
+            # MHA: 1:1 mapping, indices are the same
+            return torch.arange(len(active_q_indices), device=active_q_indices.device)
+
+        # GQA: compute which KV head each Q head maps to
+        heads_per_group = num_q_heads // num_kv_heads
+        kv_indices = active_q_indices // heads_per_group
+
+        # Remap to subset indices (unique KV heads in order they appear)
+        _, inverse = torch.unique(kv_indices, return_inverse=True)
+        return inverse
+
     def clear_cache(self) -> None:
         """Clear cached masks (useful if moving between devices)."""
         self._skip_mask_cache.clear()
