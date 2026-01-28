@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVCacheTensor,
     SlidingWindowSpec,
+    SparseAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
@@ -1186,6 +1187,73 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
         )
 
 
+def _has_sparse_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
+    """Check if any layer uses SparseAttentionSpec."""
+    return any(
+        isinstance(spec, SparseAttentionSpec) for spec in kv_cache_spec.values()
+    )
+
+
+def _get_kv_cache_groups_with_sparse(
+    kv_cache_spec: dict[str, KVCacheSpec]
+) -> list[KVCacheGroupSpec]:
+    """
+    Handle sparse KV cache allocation. Each layer gets its own tensor
+    sized according to its num_kv_heads.
+
+    This bypasses page size unification to allow sparse layers to have
+    smaller allocations proportional to their active KV head count.
+    """
+    # Log sparse layer info
+    sparse_count = sum(
+        1 for spec in kv_cache_spec.values()
+        if isinstance(spec, SparseAttentionSpec)
+    )
+    total_count = len(kv_cache_spec)
+    logger.info(
+        "Sparse KV cache allocation: %d/%d layers have reduced KV heads",
+        sparse_count,
+        total_count,
+    )
+
+    # Calculate total savings
+    from vllm.utils.torch_utils import get_dtype_size
+    full_page_size = None
+    total_full_size = 0
+    total_sparse_size = 0
+    for spec in kv_cache_spec.values():
+        if isinstance(spec, SparseAttentionSpec):
+            # Get what the full size would have been
+            if full_page_size is None:
+                full_page_size = (
+                    2 * spec.block_size * spec.original_num_kv_heads
+                    * spec.head_size * get_dtype_size(spec.dtype)
+                )
+            total_full_size += full_page_size
+            total_sparse_size += spec.page_size_bytes
+        else:
+            total_full_size += spec.page_size_bytes
+            total_sparse_size += spec.page_size_bytes
+
+    if total_full_size > 0:
+        savings = 100.0 * (1 - total_sparse_size / total_full_size)
+        logger.info(
+            "Sparse KV cache total savings: %.1f%% (%.2f GiB -> %.2f GiB per block)",
+            savings,
+            total_full_size / (1024**3),
+            total_sparse_size / (1024**3),
+        )
+
+    # Use UniformTypeKVCacheSpecs which allocates per-layer tensors
+    # with sizes based on each layer's page_size_bytes
+    block_size = next(iter(kv_cache_spec.values())).block_size
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=block_size,
+        kv_cache_specs=kv_cache_spec,
+    )
+    return _get_kv_cache_groups_uniform_type(uniform_spec)
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
@@ -1206,6 +1274,11 @@ def get_kv_cache_groups(
         # This returns an empty list to allow for the KVCacheManager to handle
         # attention free models.
         return []
+
+    # Check for sparse KV cache specs FIRST - these need special handling
+    # to avoid page size unification which would negate memory savings
+    if _has_sparse_kv_cache_specs(kv_cache_spec):
+        return _get_kv_cache_groups_with_sparse(kv_cache_spec)
 
     if is_kv_cache_spec_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for

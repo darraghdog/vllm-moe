@@ -480,13 +480,24 @@ class Attention(nn.Module, AttentionLayerBase):
         if active_kv_count >= self.num_kv_heads:
             return None
 
-        # If no KV heads are active, something is wrong - return normal spec
+        # If no KV heads are active, all Q heads are skipped - use minimal KV allocation
+        # We allocate 1 KV head as minimum (can't allocate 0)
         if active_kv_count == 0:
-            logger.warning(
-                "Layer %d has no active KV heads - using full KV cache",
+            logger.info(
+                "Layer %d: ALL KV heads skippable - using minimal allocation (1/%d KV heads, 87.5%% savings)",
                 layer_idx,
+                self.num_kv_heads,
             )
-            return None
+            # Use 1 KV head as minimum, with empty mappings
+            return SparseAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,  # Minimal allocation
+                head_size=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                original_num_kv_heads=self.num_kv_heads,
+                sparse_to_original=(0,),  # Map sparse[0] -> original[0] (placeholder)
+                original_to_sparse=tuple(-1 for _ in range(self.num_kv_heads)),  # All skipped
+            )
 
         # Only use sparse allocation if active_kv_count divides evenly into
         # original num_kv_heads. This ensures page sizes can be unified.
